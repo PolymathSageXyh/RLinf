@@ -135,6 +135,24 @@ class Cluster:
         "PKG_CONFIG_PATH",
         "CPATH",
     }
+    INHERITED_WORKER_ENV_DROP_PREFIXES = (
+        "COPILOT_",
+        "KAIC_",
+        "KUBERNETES_",
+        "VSCODE_",
+    )
+    INHERITED_WORKER_ENV_DROP_NAMES = {
+        "BROWSER",
+        "LS_COLORS",
+        "NB_PREFIX",
+        "NODE_OPTIONS",
+        "SSH_AUTHORIZED_KEYS",
+        "SSH_CLIENT",
+        "SSH_CONNECTION",
+        "SSH_PORT",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+    }
 
     class NamespaceConflictError(Exception):
         """Raised when there is a namespace conflict in Ray initialization."""
@@ -334,6 +352,13 @@ class Cluster:
             ray_init_kwargs = {
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
+                "_system_config": {
+                    "worker_register_timeout_seconds": int(
+                        os.environ.get(
+                            "RLINF_RAY_WORKER_REGISTER_TIMEOUT_SECONDS", "300"
+                        )
+                    ),
+                },
             }
             if self._ray_code_sync_fragment is not None:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
@@ -695,7 +720,7 @@ class Cluster:
         node_group = self.get_node_group(node_group_label)
         remote_cls = ray.remote(cls)
 
-        merged_env_vars = node.env_vars.copy()
+        merged_env_vars = Cluster.sanitize_inherited_worker_env_vars(node.env_vars)
         path_env_merge_mode = self.get_path_env_merge_mode(merged_env_vars)
         # Update with user-specified env vars in node group configs
         cfg_node_env_vars = node_group.get_node_env_vars(node_rank)
@@ -830,6 +855,23 @@ class Cluster:
             else:
                 merged[key] = value
         return merged
+
+    @classmethod
+    def sanitize_inherited_worker_env_vars(
+        cls,
+        env_vars: dict[str, str],
+    ) -> dict[str, str]:
+        """Drop bulky platform/IDE env vars inherited from the launcher shell.
+
+        User-provided node env vars and worker-specific env vars are merged after
+        this step, so explicit config still takes precedence.
+        """
+        return {
+            key: value
+            for key, value in env_vars.items()
+            if key not in cls.INHERITED_WORKER_ENV_DROP_NAMES
+            and not key.startswith(cls.INHERITED_WORKER_ENV_DROP_PREFIXES)
+        }
 
     @staticmethod
     def _split_path_entries(path_value: Optional[str]) -> list[str]:

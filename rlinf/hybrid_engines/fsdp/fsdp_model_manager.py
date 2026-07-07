@@ -65,6 +65,8 @@ class FSDPModelManager:
         """
         self._cfg = cfg
         self._logger = get_logger()
+        self.world_size = world_size
+        self.rank = rank
         self.torch_dtype = torch_dtype_from_precision(self._cfg.model.precision)
         if self.torch_dtype != torch.float32:
             self._logger.warning(
@@ -342,7 +344,11 @@ class FSDPModelManager:
             self.is_optimizer_offloaded = False
 
         self._strategy.load_checkpoint(
-            self.model, self.optimizer, self.lr_scheduler, load_path
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            load_path,
+            checkpoint_format=self._cfg.fsdp_config.get("checkpoint_format", "dcp"),
         )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
@@ -369,6 +375,7 @@ class FSDPModelManager:
             save_full_model_weights=self._cfg.fsdp_config.get(
                 "save_full_model_weights", True
             ),
+            checkpoint_format=self._cfg.fsdp_config.get("checkpoint_format", "dcp"),
         )
 
         if restore_weight_offload:
@@ -414,6 +421,108 @@ class FSDPModelManager:
         self._strategy.onload_optimizer(self.optimizer, device_id)
         self.is_optimizer_offloaded = False
 
+    @staticmethod
+    def _same_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+        try:
+            return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+        except RuntimeError:
+            return False
+
+    def _restore_no_shard_orig_param_views(self) -> None:
+        """
+        Restore FSDP original-parameter views for single-rank training.
+
+        PyTorch may switch FULL_SHARD to NO_SHARD when world size is 1. With
+        use_orig_params=True, FSDP can enter the next pre-forward with module
+        parameters exposed as 2D tensors while its writeback path expects a 1D
+        flat-shard view. Copy changed values back into the flat parameter and
+        rebind the original parameters through FSDP own sharded-view helper.
+        """
+        if self.world_size != 1:
+            return
+
+        all_handles = getattr(self.model, "_all_handles", None)
+        if not all_handles:
+            return
+
+        restored_handles = 0
+        with torch.no_grad():
+            for handle in all_handles:
+                if not getattr(handle, "_use_orig_params", False):
+                    continue
+
+                flat_param = getattr(handle, "flat_param", None)
+                params = getattr(flat_param, "_params", None)
+                shard_infos = getattr(flat_param, "_shard_param_infos", None)
+                param_infos = getattr(flat_param, "_param_infos", None)
+                if (
+                    flat_param is None
+                    or params is None
+                    or shard_infos is None
+                    or param_infos is None
+                ):
+                    continue
+
+                flat_data = flat_param.data
+                needs_rebind = False
+                for param, shard_info, param_info in zip(
+                    params, shard_infos, param_infos
+                ):
+                    if param is None or param.numel() == 0:
+                        continue
+                    in_shard, offset_in_shard, numel_in_shard, *_ = shard_info
+                    if not in_shard or numel_in_shard == 0:
+                        continue
+
+                    param_name, module, _ = param_info
+                    current_param = getattr(module, param_name, param)
+                    if not isinstance(current_param, torch.Tensor):
+                        current_param = param
+
+                    current_changed = current_param is not param
+                    copy_source = None
+                    if current_changed:
+                        needs_rebind = True
+                        if not self._same_storage(current_param, flat_param):
+                            copy_source = current_param
+                    elif not self._same_storage(param, flat_param):
+                        copy_source = param
+
+                    if copy_source is None:
+                        continue
+
+                    param_data = copy_source.detach().reshape(-1)
+                    if param_data.numel() != numel_in_shard:
+                        raise RuntimeError(
+                            "Cannot restore FSDP original parameter view: "
+                            f"expected {numel_in_shard} values but got "
+                            f"{param_data.numel()} from shape "
+                            f"{tuple(copy_source.shape)}."
+                        )
+                    if param_data.device != flat_data.device or (
+                        param_data.dtype != flat_data.dtype
+                    ):
+                        param_data = param_data.to(
+                            device=flat_data.device, dtype=flat_data.dtype
+                        )
+                    flat_data[
+                        offset_in_shard : offset_in_shard + numel_in_shard
+                    ].copy_(param_data)
+                    needs_rebind = True
+
+                if needs_rebind:
+                    handle._use_sharded_views()
+                    restored_handles += 1
+
+        if restored_handles and not getattr(
+            self, "_logged_no_shard_orig_param_restore", False
+        ):
+            self._logger.info(
+                "[FSDP] Restored single-rank original-parameter views for "
+                f"{restored_handles} handle(s)."
+            )
+            self._logged_no_shard_orig_param_restore = True
+
     def optimizer_step(self) -> tuple[float, list[float]]:
         """
         Perform optimizer step using its optimizer, lr_scheduler and grad_scaler.
@@ -433,6 +542,7 @@ class FSDPModelManager:
             )
         else:
             self.grad_scaler.step(optimizer=self.optimizer)
+            self._restore_no_shard_orig_param_views()
 
         self.grad_scaler.update()
 
@@ -687,6 +797,7 @@ class FSDPModelManager:
         Returns:
             A context manager for the micro-batch processing.
         """
+        self._restore_no_shard_orig_param_views()
         return self._strategy.before_micro_batch(
             model=model, is_last_micro_batch=is_last_micro_batch
         )

@@ -185,9 +185,12 @@ def openai_gelu(x):
     return gelu_impl(x)
 
 
-try:
-    jit_fuser = torch.compile
-except Exception:
+if os.environ.get("RLINF_USE_TORCH_COMPILE_JIT_FUSER", "0") == "1":
+    try:
+        jit_fuser = torch.compile
+    except Exception:
+        jit_fuser = torch.jit.script
+else:
     jit_fuser = torch.jit.script
 
 

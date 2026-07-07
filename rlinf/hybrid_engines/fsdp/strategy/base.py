@@ -181,6 +181,103 @@ class FSDPStrategyBase(ABC):
         print(f"Save using _use_new_zipfile_serialization to {path}")
 
     @classmethod
+    def _clean_fsdp_state_key(cls, key: str) -> str:
+        return key.replace("_fsdp_wrapped_module.", "")
+
+    @classmethod
+    def _tensor_to_cpu(cls, tensor: torch.Tensor) -> torch.Tensor:
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
+        return tensor.detach().cpu().clone()
+
+    @classmethod
+    def _iter_non_persistent_buffer_names(cls, model: nn.Module) -> set[str]:
+        names = set()
+        for module_name, module in model.named_modules():
+            for buffer_name in module._non_persistent_buffers_set:
+                names.add(
+                    f"{module_name}.{buffer_name}" if module_name else buffer_name
+                )
+        return names
+
+    @classmethod
+    def _find_module_attr(cls, model: nn.Module, attr_name: str):
+        if hasattr(model, attr_name):
+            return getattr(model, attr_name)
+        for module in model.modules():
+            if hasattr(module, attr_name):
+                return getattr(module, attr_name)
+        return None
+
+    @classmethod
+    def _load_fallback_state_dict(cls, source: str | None) -> dict:
+        if not source:
+            return {}
+
+        import safetensors.torch
+
+        state_dict = {}
+        for source_path in str(source).split(","):
+            source_path = source_path.strip()
+            if not source_path or not os.path.exists(source_path):
+                continue
+            if source_path.endswith(".safetensors"):
+                loaded_state = safetensors.torch.load_file(source_path, device="cpu")
+            else:
+                loaded_state = torch.load(source_path, map_location="cpu")
+            state_dict.update(loaded_state)
+        return state_dict
+
+    @classmethod
+    def _merge_fallback_state_dict(
+        cls, state_dict: dict[str, torch.Tensor], model: nn.Module
+    ) -> None:
+        fallback_source = cls._find_module_attr(
+            model, "_rlinf_full_weight_fallback_state_source"
+        )
+        for name, value in cls._load_fallback_state_dict(fallback_source).items():
+            clean_name = cls._clean_fsdp_state_key(name)
+            if clean_name not in state_dict and isinstance(value, torch.Tensor):
+                state_dict[clean_name] = cls._tensor_to_cpu(value)
+
+    @classmethod
+    def get_direct_full_model_state_dict(
+        cls, model: nn.Module
+    ) -> dict[str, torch.Tensor]:
+        """Collect model tensors without invoking FSDP state-dict hooks.
+
+        The current FSDP view is authoritative for updated trainable weights.
+        Frozen weights that FSDP does not expose are filled from the checkpoint
+        that initialized the model, which is valid for train-expert-only runs.
+        """
+        state_dict = {}
+        for name, param in model.named_parameters():
+            state_dict[cls._clean_fsdp_state_key(name)] = cls._tensor_to_cpu(param)
+
+        non_persistent_buffers = cls._iter_non_persistent_buffer_names(model)
+        for name, buffer in model.named_buffers():
+            if name in non_persistent_buffers:
+                continue
+            clean_name = cls._clean_fsdp_state_key(name)
+            if clean_name not in state_dict:
+                state_dict[clean_name] = cls._tensor_to_cpu(buffer)
+
+        cls._merge_fallback_state_dict(state_dict, model)
+        return state_dict
+
+    @classmethod
+    def get_full_model_state_dict_for_save(
+        cls,
+        model: Union[FSDP, FSDPModule],
+        checkpoint_format: str,
+    ) -> dict:
+        if checkpoint_format == "trainable_only":
+            return cls.get_direct_full_model_state_dict(model)
+
+        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        return get_model_state_dict(model=model, options=opts)
+
+    @classmethod
     def save_checkpoint(
         cls,
         model: Union[FSDP, FSDPModule],
@@ -219,10 +316,13 @@ class FSDPStrategyBase(ABC):
                 fsdp_version=cls.get_fsdp_version(),
                 checkpoint_format=checkpoint_format,
             )
-            if checkpoint_format == "local_shard":
-                local_shard_save_path = os.path.join(
-                    save_path, "local_shard_checkpoint"
+            if checkpoint_format in {"local_shard", "trainable_only"}:
+                checkpoint_dir_name = (
+                    "local_shard_checkpoint"
+                    if checkpoint_format == "local_shard"
+                    else "trainable_only_checkpoint"
                 )
+                local_shard_save_path = os.path.join(save_path, checkpoint_dir_name)
                 rank = torch.distributed.get_rank()
                 os.makedirs(local_shard_save_path, exist_ok=True)
                 torch.save(
@@ -248,9 +348,10 @@ class FSDPStrategyBase(ABC):
         torch.distributed.barrier()
 
         if save_full_model_weights:
-            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
             sd_save_path = os.path.join(save_path, "model_state_dict")
-            model_state_dict = get_model_state_dict(model=model, options=opts)
+            model_state_dict = cls.get_full_model_state_dict_for_save(
+                model, checkpoint_format
+            )
             if torch.distributed.get_rank() == 0:
                 os.makedirs(sd_save_path, exist_ok=True)
                 # npu requires a specific model parameter save
@@ -263,6 +364,13 @@ class FSDPStrategyBase(ABC):
                     torch.save(
                         model_state_dict, os.path.join(sd_save_path, "full_weights.pt")
                     )
+
+                norm_stats = cls._find_module_attr(model, "_rlinf_norm_stats")
+                asset_id = cls._find_module_attr(model, "_rlinf_norm_stats_asset_id")
+                if norm_stats is not None and asset_id is not None:
+                    from openpi.shared import normalize as _normalize
+
+                    _normalize.save(os.path.join(save_path, asset_id), norm_stats)
 
             torch.distributed.barrier()
 
@@ -301,19 +409,24 @@ class FSDPStrategyBase(ABC):
             checkpoint_format=checkpoint_format,
         )
         try:
-            if checkpoint_format == "local_shard":
+            if checkpoint_format in {"local_shard", "trainable_only"}:
                 rank = torch.distributed.get_rank()
+                checkpoint_dir_name = (
+                    "local_shard_checkpoint"
+                    if checkpoint_format == "local_shard"
+                    else "trainable_only_checkpoint"
+                )
                 local_ckpt_file = os.path.join(
-                    load_path, "local_shard_checkpoint", f"checkpoint_rank_{rank}.pt"
+                    load_path, checkpoint_dir_name, f"checkpoint_rank_{rank}.pt"
                 )
                 if not os.path.isfile(local_ckpt_file):
                     raise FileNotFoundError(
-                        f"Expected local shard checkpoint '{local_ckpt_file}' not found"
+                        f"Expected {checkpoint_format} checkpoint '{local_ckpt_file}' not found"
                     )
 
                 if hasattr(cls, "logger") and cls.logger is not None:
                     cls.logger.info(
-                        f"[Checkpoint] loading local shard checkpoint from {local_ckpt_file}"
+                        f"[Checkpoint] loading {checkpoint_format} checkpoint from {local_ckpt_file}"
                     )
 
                 checkpoint = torch.load(local_ckpt_file, weights_only=False)

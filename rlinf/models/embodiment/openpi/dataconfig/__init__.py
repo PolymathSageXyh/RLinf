@@ -15,6 +15,8 @@
 
 import dataclasses
 import difflib
+import logging
+import pathlib
 from typing import Optional
 
 import openpi.models.pi0_config as pi0_config
@@ -25,6 +27,11 @@ from openpi.training.config import (
     DataConfig,
     TrainConfig,
 )
+
+try:
+    import openpi.models.pi0_meanflow as pi0_meanflow
+except ImportError:
+    pi0_meanflow = None
 
 from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
     LeRobotBehaviorDataConfig,
@@ -489,11 +496,128 @@ _CONFIGS = [
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
+_MEANFLOW_CONFIG_SUFFIX = "_meanflow"
+
+
+def _to_meanflow_config(config_name: str, config: TrainConfig) -> TrainConfig:
+    """Return a pi0.5 config copy whose model is Pi0MeanflowConfig."""
+    if pi0_meanflow is None:
+        raise ImportError(
+            f"Config '{config_name}' requires openpi.models.pi0_meanflow."
+        )
+    if not isinstance(config.model, pi0_config.Pi0Config) or not config.model.pi05:
+        raise ValueError(
+            f"Config '{config_name}' can only be derived from an existing pi05_* "
+            "OpenPI config because PI0PytorchMeanflow currently supports pi0.5."
+        )
+
+    meanflow_fields = {
+        field.name for field in dataclasses.fields(pi0_meanflow.Pi0MeanflowConfig)
+    }
+    model_kwargs = {
+        field_name: getattr(config.model, field_name)
+        for field_name in meanflow_fields
+        if hasattr(config.model, field_name)
+    }
+    model = pi0_meanflow.Pi0MeanflowConfig(**model_kwargs)
+    return dataclasses.replace(config, name=config_name, model=model)
+
+
+def _available_config_names() -> list[str]:
+    meanflow_names = [
+        f"{name}{_MEANFLOW_CONFIG_SUFFIX}"
+        for name, value in _CONFIGS_DICT.items()
+        if isinstance(value.model, pi0_config.Pi0Config) and value.model.pi05
+    ]
+    return list(_CONFIGS_DICT.keys()) + meanflow_names
+
+
+def _resolve_config(config_name: str) -> TrainConfig:
+    if config_name in _CONFIGS_DICT:
+        return _CONFIGS_DICT[config_name]
+
+    if config_name.endswith(_MEANFLOW_CONFIG_SUFFIX):
+        base_config_name = config_name[: -len(_MEANFLOW_CONFIG_SUFFIX)]
+        if base_config_name in _CONFIGS_DICT:
+            return _to_meanflow_config(config_name, _CONFIGS_DICT[base_config_name])
+
+    closest = difflib.get_close_matches(
+        config_name, _available_config_names(), n=1, cutoff=0.0
+    )
+    closest_str = f" Did you mean '{closest[0]}'? " if closest else ""
+    raise ValueError(f"Config '{config_name}' not found.{closest_str}")
+
+
+def _norm_stats_path(assets_dir: pathlib.Path, asset_id: str | None) -> pathlib.Path | None:
+    if asset_id is None:
+        return None
+    return assets_dir / asset_id / "norm_stats.json"
+
+
+def _find_assets_dir_for_model_path(
+    config: TrainConfig, model_path: str
+) -> pathlib.Path | None:
+    """Find an assets dir near model_path without assuming every checkpoint owns one."""
+    data_config = config.data
+    asset_id = data_config.assets.asset_id or data_config.repo_id
+    path = pathlib.Path(model_path).expanduser()
+
+    candidates = [
+        path,
+        path / "assets",
+    ]
+    if config.name.endswith(_MEANFLOW_CONFIG_SUFFIX):
+        base_config_name = config.name[: -len(_MEANFLOW_CONFIG_SUFFIX)]
+    else:
+        base_config_name = config.name
+
+    for root in [path.parent, *path.parents]:
+        candidates.extend(
+            [
+                root / "assets" / config.name,
+                root / "assets" / base_config_name,
+            ]
+        )
+        if root.name == "checkpoints":
+            repo_root = root.parent
+            candidates.extend(
+                [
+                    repo_root / "assets" / config.name,
+                    repo_root / "assets" / base_config_name,
+                ]
+            )
+
+    if data_config.assets.assets_dir is not None:
+        original_assets_dir = pathlib.Path(data_config.assets.assets_dir)
+        candidates.append(original_assets_dir)
+        if not original_assets_dir.is_absolute():
+            for root in path.parents:
+                candidates.append(root / original_assets_dir)
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        norm_stats_path = _norm_stats_path(candidate, asset_id)
+        if norm_stats_path is not None and norm_stats_path.exists():
+            return candidate
+
+    return None
 
 
 def _override_with_model_path(config: TrainConfig, model_path: str) -> TrainConfig:
     """Return a copy of the config with assets/weight paths set from model_path."""
     data_config = config.data
+    assets_dir = _find_assets_dir_for_model_path(config, model_path)
+    if assets_dir is None:
+        logging.info(
+            "Could not find norm stats near model_path=%s; using model_path as assets_dir.",
+            model_path,
+        )
+        assets_dir = pathlib.Path(model_path)
+
     if (
         dataclasses.is_dataclass(data_config)
         and hasattr(data_config, "assets")
@@ -501,7 +625,7 @@ def _override_with_model_path(config: TrainConfig, model_path: str) -> TrainConf
     ):
         data_config = dataclasses.replace(
             data_config,
-            assets=dataclasses.replace(data_config.assets, assets_dir=model_path),
+            assets=dataclasses.replace(data_config.assets, assets_dir=str(assets_dir)),
         )
 
     replace_kwargs = {
@@ -540,14 +664,7 @@ def get_openpi_config(
             When using a local path, the original asset_id is preserved so
             that norm_stats can still be loaded from the model checkpoint.
     """
-    if config_name not in _CONFIGS_DICT:
-        closest = difflib.get_close_matches(
-            config_name, _CONFIGS_DICT.keys(), n=1, cutoff=0.0
-        )
-        closest_str = f" Did you mean '{closest[0]}'? " if closest else ""
-        raise ValueError(f"Config '{config_name}' not found.{closest_str}")
-
-    config = _CONFIGS_DICT[config_name]
+    config = _resolve_config(config_name)
     if model_path is not None:
         config = _override_with_model_path(config, model_path)
     if data_kwargs is not None:

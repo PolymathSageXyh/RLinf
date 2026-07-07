@@ -35,9 +35,72 @@ from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
 
+try:
+    from openpi.models.pi0_meanflow import Pi0MeanflowConfig
+except ImportError:
+    Pi0MeanflowConfig = None
+
+try:
+    from openpi.models_pytorch.pi0_pytorch_meanflow import PI0PytorchMeanflow
+except ImportError as exc:
+    PI0PytorchMeanflow = None
+    _PI0_MEANFLOW_IMPORT_ERROR = exc
+else:
+    _PI0_MEANFLOW_IMPORT_ERROR = None
+
+_Pi0MeanflowConfigBase = Pi0MeanflowConfig if Pi0MeanflowConfig is not None else Pi0Config
+_PI0PytorchMeanflowBase = (
+    PI0PytorchMeanflow if PI0PytorchMeanflow is not None else torch.nn.Module
+)
+
 
 def _to_numpy(x):
     return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
+
+
+def _run_without_torch_compile(fn):
+    original_compile = torch.compile
+    torch.compile = lambda function, *args, **kwargs: function
+    try:
+        return fn()
+    finally:
+        torch.compile = original_compile
+
+
+def _call_without_forced_expert_checkpointing(model, fn):
+    paligemma_with_expert = getattr(model, "paligemma_with_expert", None)
+    if paligemma_with_expert is None:
+        return fn()
+    previous_training = paligemma_with_expert.training
+    paligemma_with_expert.training = False
+    try:
+        return fn()
+    finally:
+        paligemma_with_expert.training = previous_training
+
+
+def _prepare_openpi_sft_batch(data, device: torch.device | int | str):
+    if isinstance(data, tuple):
+        observation, actions = data
+    else:
+        observation = data["observation"]
+        actions = data["actions"]
+
+    register_pytree_dataclasses(observation)
+    observation = tree_map(
+        lambda x: (
+            torch.as_tensor(x, device=device).contiguous().clone()
+            if x is not None
+            else x
+        ),
+        observation,
+    )
+    if not isinstance(actions, torch.Tensor):
+        actions = torch.as_tensor(actions, device=device)
+    else:
+        actions = actions.to(device=device)
+    actions = actions.to(dtype=torch.float32)
+    return observation, actions
 
 
 @dataclass(frozen=True)
@@ -103,6 +166,716 @@ class OpenPi0Config(Pi0Config):
     state_indices: list[int] | None = None
 
 
+@dataclass(frozen=True)
+class OpenPi0MeanFlowConfig(_Pi0MeanflowConfigBase):
+    config_name: str = "pi05_libero_meanflow"
+    num_images_in_input: int = 2
+    action_chunk: int = 5
+    action_env_dim: int = 7
+    num_steps: int = 10
+    train_expert_only: bool = False
+    meanflow_init_scope: str = "all_compatible"
+    noise_method: str = "flow_noise"
+    noise_logvar_range: list = field(default_factory=lambda: [0.08, 0.16])
+    safe_get_logprob: bool = False
+    joint_logprob: bool = True
+    double_layer: bool = False
+    ignore_last: bool = False
+    add_value_head: bool = False
+    value_after_vlm: bool = False
+    value_vlm_mode: str = "mean_token"
+    detach_critic_input: bool = False
+    chunk_critic_input: bool = False
+
+
+class OpenPi0MeanFlowForRLActionPrediction(_PI0PytorchMeanflowBase, BasePolicy):
+    """PI0-MeanFlow wrapper shaped like RLinf OpenPI policies."""
+
+    config: OpenPi0MeanFlowConfig
+
+    @property
+    def _no_split_modules(self) -> list[str]:
+        if self.config.train_expert_only:
+            no_split_modules = [
+                "GemmaDecoderLayer",
+                "SiglipVisionEmbeddings",
+                "GemmaRMSNorm",
+                "GemmaRotaryEmbedding",
+            ]
+        else:
+            no_split_modules = [
+                "GemmaMLP",
+                "SiglipVisionEmbeddings",
+                "GemmaRMSNorm",
+                "GemmaRotaryEmbedding",
+            ]
+        if self.config.noise_method == "flow_noise":
+            no_split_modules.append("ExploreNoiseNet")
+        return no_split_modules
+
+    @property
+    def _no_split_names(self) -> list[str]:
+        return [
+            "action_in_proj",
+            "action_out_proj",
+            "lm_head",
+            "state_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+            "time_mlp_in",
+            "time_mlp_out",
+            "r_time_mlp_in",
+            "r_time_mlp_out",
+            "time_fusion_mlp",
+        ]
+
+    def __init__(self, config: OpenPi0MeanFlowConfig):
+        if PI0PytorchMeanflow is None:
+            raise ImportError(
+                "OpenPI MeanFlow requires "
+                "openpi.models_pytorch.pi0_pytorch_meanflow.PI0PytorchMeanflow."
+            ) from _PI0_MEANFLOW_IMPORT_ERROR
+        sample_actions_func = self.sample_actions
+        _run_without_torch_compile(lambda: _PI0PytorchMeanflowBase.__init__(self, config))
+        self.sample_actions = sample_actions_func
+        self.logger = get_logger()
+        self.global_step = 0
+         # assert
+        assert not (self.config.double_layer and self.config.joint_logprob), (
+            "double_layer and joint_logprob can not be set at the same time"
+        )
+
+        suffix_width = self.action_out_proj.in_features
+        proj_width = 2048 if self.config.value_after_vlm else suffix_width
+        if self.config.add_value_head:
+            if "pi05_" in self.config.config_name or getattr(self, "pi05", False):
+                value_head_hidden_sizes = (1024, 512, 256)
+            else:
+                value_head_hidden_sizes = (512, 256, 128)
+            self.value_head = ValueHead(
+                input_dim=proj_width,
+                hidden_sizes=value_head_hidden_sizes,
+                output_dim=1,
+                activation="relu",
+                bias_last=True,
+            )
+        self.use_vlm_value = getattr(self.config, "value_after_vlm", False) and getattr(
+            self.config, "add_value_head", False
+        )
+        if self.config.noise_method == "flow_noise":
+            self.noise_head = ExploreNoiseNet(
+                in_dim=suffix_width,
+                out_dim=self.config.action_dim,
+                hidden_dims=[128, 64],
+                activation_type="tanh",
+                noise_logvar_range=self.config.noise_logvar_range,
+                noise_scheduler_type="learn",
+            )
+
+        for name, module in self.named_modules():
+            path_parts = name.split(".")
+            setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
+
+    def set_global_step(self, global_step):
+        self.global_step = global_step
+
+    def setup_wrappers(
+        self,
+        transforms: Sequence[_transforms.DataTransformFn] = (),
+        output_transforms: Sequence[_transforms.DataTransformFn] = (),
+    ):
+        self._input_transform = _transforms.compose(transforms)
+        self._output_transform = _transforms.compose(output_transforms)
+
+    def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
+        if forward_type == ForwardType.SFT:
+            return self.sft_forward(**kwargs)
+        elif forward_type == ForwardType.DEFAULT:
+            return self.default_forward(**kwargs)
+        else:
+            raise NotImplementedError(
+                "OpenPI MeanFlow supports only ForwardType.SFT and "
+                "ForwardType.DEFAULT."
+            )
+
+    def sft_forward(self, data, use_action_chunk_loss: bool = False, **kwargs):
+        if hasattr(self, "gradient_checkpointing_disable"):
+            self.gradient_checkpointing_disable()
+
+        if use_action_chunk_loss:
+            raise ValueError(
+                "OpenPI MeanFlow SFT returns a scalar adaptive loss and does not "
+                "support use_action_chunk_loss=True."
+            )
+
+        device = next(self.parameters()).device
+        observation, actions = _prepare_openpi_sft_batch(data, device)
+        loss = _call_without_forced_expert_checkpointing(
+            self,
+            lambda: super(OpenPi0MeanFlowForRLActionPrediction, self).forward(
+                observation,
+                actions,
+                global_step=self.global_step,
+                num_train_steps=kwargs.get("num_train_steps"),
+            ),
+        )
+        return loss.mean() if loss.ndim > 0 else loss
+
+    def input_transform(self, obs: dict, transpose=True):
+        inputs = tree_map(lambda x: x, obs)
+        first_process = "prompt" in inputs.keys()
+        if first_process:
+            inputs.pop("prompt")
+        else:
+            inputs = {key: inputs[key] for key in inputs.keys() if "/" in key}
+
+        inputs = tree_map(_to_numpy, inputs)
+        batch_size = next(v.shape[0] for v in inputs.values() if hasattr(v, "shape"))
+        transformed_samples = []
+        for i in range(batch_size):
+            sample = tree_map(lambda x: x[i], inputs)
+            if transpose:
+                sample = tree_map(
+                    lambda x: (
+                        x.transpose(1, 2, 0) if len(x.shape) == 3 and transpose else x
+                    ),
+                    sample,
+                )
+            else:
+                sample = tree_map(lambda x: x if len(x.shape) == 3 else x, sample)
+            if first_process:
+                sample["prompt"] = obs["prompt"][i]
+            else:
+                sample["prompt"] = "xxxx"
+            transformed_samples.append(self._input_transform(sample))
+        inputs = tree_map(
+            lambda *torch_arr: torch.from_numpy(np.asarray(torch_arr).copy()),
+            *transformed_samples,
+        )
+        if not first_process:
+            inputs["tokenized_prompt"] = obs["tokenized_prompt"]
+            inputs["tokenized_prompt_mask"] = obs["tokenized_prompt_mask"]
+        return inputs
+
+    def output_transform(self, outputs):
+        batch_size = outputs["actions"].shape[0]
+        transformed_samples = []
+        for i in range(batch_size):
+            sample = tree_map(lambda x: np.asarray(x[i].detach().cpu()), outputs)
+            transformed_samples.append(self._output_transform(sample))
+        outputs = tree_map(
+            lambda *torch_arr: torch.from_numpy(np.asarray(torch_arr).copy()),
+            *transformed_samples,
+        )
+        outputs["actions"] = outputs["actions"][:, : self.config.action_chunk]
+        return outputs
+
+    def default_forward(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        **kwargs,
+    ) -> dict[str, Any]:
+        compute_values = kwargs.get("compute_values", False)
+        device = next(self.parameters()).device
+        chains = forward_inputs["chains"].to(device)
+        denoise_inds = forward_inputs["denoise_inds"].to(device)
+
+        observation = self.input_transform(forward_inputs, transpose=False)
+        observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        if lang_tokens is not None:
+            lang_tokens = lang_tokens.to(device)
+        if lang_masks is not None:
+            lang_masks = lang_masks.to(device)
+        state = state.to(device)
+
+        log_probs, value_t, entropy = self.get_log_prob_value(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            chains,
+            denoise_inds,
+            compute_values,
+        )
+        log_probs = log_probs[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        entropy = entropy[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        log_probs = log_probs.mean(dim=1)
+        entropy = entropy.mean(dim=[1, 2, 3], keepdim=False)[:, None]
+        value_t = value_t.mean(dim=-1, keepdim=False)
+        return {
+            "logprobs": log_probs,
+            "values": value_t,
+            "entropy": entropy,
+        }
+
+    def obs_processor(self, env_obs):
+        processed_obs = {
+            "observation/image": env_obs["main_images"],
+            "prompt": env_obs["task_descriptions"],
+        }
+        if "calvin" in self.config.config_name:
+            state = env_obs["states"]
+            processed_obs["observation/state_ee_pos"] = state[:, :3]
+            processed_obs["observation/state_ee_rot"] = state[:, 3:6]
+            processed_obs["observation/state_gripper"] = state[:, 6:7]
+        else:
+            processed_obs["observation/state"] = env_obs["states"]
+        if env_obs["wrist_images"] is not None:
+            processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
+        if env_obs["extra_view_images"] is not None:
+            processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
+        return processed_obs
+
+    def precision_processor(self, processed_obs):
+        device = next(self.parameters()).device
+        for key, value in processed_obs.items():
+            if isinstance(value, list):
+                processed_obs[key] = [
+                    item.to(device=device).contiguous()
+                    if torch.is_tensor(item)
+                    else item
+                    for item in value
+                ]
+            elif torch.is_tensor(value):
+                processed_obs[key] = value.to(device=device).contiguous()
+            elif isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    processed_obs[key][sub_key] = sub_value.to(
+                        device=device
+                    ).contiguous()
+        return processed_obs
+
+    def predict_action_batch(
+        self,
+        env_obs,
+        mode: Literal["train", "eval"] = "train",
+        compute_values=True,
+        **kwargs,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        to_process_obs = self.obs_processor(env_obs)
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        observation = _model.Observation.from_dict(processed_obs)
+
+        outputs = self.sample_actions(
+            observation, mode=mode, compute_values=compute_values
+        )
+        actions = self.output_transform(
+            {"actions": outputs["actions"], "state": observation.state}
+        )["actions"]
+
+        forward_inputs = {
+            "chains": outputs["chains"],
+            "denoise_inds": outputs["denoise_inds"],
+            "tokenized_prompt": processed_obs["tokenized_prompt"],
+            "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
+            "action": actions.reshape(actions.shape[0], -1).contiguous(),
+            "model_action": outputs["actions"]
+            .reshape(outputs["actions"].shape[0], -1)
+            .contiguous(),
+        }
+        cloned_obs = copy_dict_tensor(
+            {k: v for k, v in to_process_obs.items() if k != "prompt"}
+        )
+        forward_inputs.update(cloned_obs)
+
+        return actions, {
+            "prev_logprobs": outputs["prev_logprobs"],
+            "prev_values": outputs["prev_values"],
+            "forward_inputs": forward_inputs,
+        }
+
+    @torch.no_grad()
+    def sample_actions(
+        self,
+        observation: _model.Observation,
+        noise=None,
+        mode="train",
+        compute_values=True,
+    ) -> dict[str, Any]:
+        bsize = observation.state.shape[0]
+        device = observation.state.device
+        num_steps = self.config.num_steps
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+        else:
+            noise = noise.to(self.action_in_proj.weight.dtype)
+
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+            images, img_masks, lang_tokens, lang_masks
+        )
+
+        x_t = noise
+        chains = []
+        log_probs = []
+        values = []
+        chains.append(x_t)
+
+        if self.use_vlm_value:
+            values_vlm = self.get_value_from_vlm(prefix_output)
+        if self.config.joint_logprob:
+            initial_log_prob = self.get_logprob_norm(
+                x_t, torch.zeros_like(noise), torch.ones_like(noise)
+            )
+            log_probs.append(initial_log_prob)
+
+        if mode == "train":
+            if self.config.joint_logprob:
+                denoise_inds = torch.arange(num_steps, device=device)
+            else:
+                if self.config.ignore_last:
+                    selected_ind = random.randint(0, num_steps - 2)
+                else:
+                    selected_ind = random.randint(0, num_steps - 1)
+                denoise_inds = torch.full(
+                    (num_steps,),
+                    selected_ind,
+                    dtype=torch.long,
+                    device=device,
+                )
+        else:
+            denoise_inds = torch.full(
+                (num_steps,),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+        denoise_inds = denoise_inds[None].repeat(bsize, 1)
+
+        for idx in range(num_steps):
+            if idx == denoise_inds[0][idx]:
+                sample_method = self.config.noise_method
+            else:
+                sample_method = "flow_ode"
+            x_t_mean, x_t_std, value_t, _ = self.sample_mean_var_val(
+                x_t,
+                idx,
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                sample_method,
+                num_steps,
+                compute_values,
+            )
+            x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
+            log_probs.append(self.get_logprob_norm(x_t, x_t_mean, x_t_std))
+            values.append(value_t)
+            chains.append(x_t)
+
+        x_0 = x_t
+        chains = torch.stack(chains, dim=1)
+        log_probs = torch.stack(log_probs, dim=1)[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        if self.config.joint_logprob:
+            log_probs = log_probs.mean(dim=1)
+        else:
+            log_probs = log_probs[
+                torch.arange(log_probs.shape[0], device=device),
+                denoise_inds[:, 0],
+            ]
+
+        if self.use_vlm_value:
+            values = values_vlm[:, None]
+        else:
+            values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
+        return {
+            "actions": x_0,
+            "chains": chains,
+            "prev_logprobs": log_probs,
+            "prev_values": values,
+            "denoise_inds": denoise_inds,
+        }
+
+    def _get_timesteps(self, denoise_steps, device):
+        timesteps = torch.linspace(1, 1 / denoise_steps, denoise_steps, device=device)
+        return torch.cat([timesteps, torch.tensor([0.0], device=device)])
+
+    def sample_mean_var_val(
+        self,
+        x_t,
+        idx,
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        sample_method,
+        denoise_steps,
+        compute_values=True,
+    ):
+        """Compute one MeanFlow transition for flow_ode or flow_noise."""
+        bsize = state.shape[0]
+        device = state.device
+        if isinstance(idx, int):
+            idx = torch.full((bsize,), idx, dtype=torch.long, device=device)
+        else:
+            idx = idx.to(device=device, dtype=torch.long)
+
+        timesteps = self._get_timesteps(denoise_steps, device)
+        timestep = timesteps[idx]
+        r_timestep = timesteps[idx + 1]
+        v_t, suffix_out = self.get_velocity(
+            state, x_t, timestep, r_timestep, prefix_pad_masks, past_key_values
+        )
+
+        if (
+            self.config.add_value_head
+            and compute_values
+            and not self.config.value_after_vlm
+        ):
+            value_t = self._compute_value_from_suffix(suffix_out)
+        else:
+            value_t = torch.zeros((bsize), device=device)
+
+        dt = (r_timestep - timestep)[:, None, None].expand_as(x_t)
+        x_t_mean = x_t + dt * v_t
+        if sample_method == "flow_ode":
+            x_t_std = torch.zeros_like(x_t_mean)
+        elif sample_method == "flow_noise":
+            x_t_std = self.noise_head(suffix_out)
+        else:
+            raise ValueError(
+                "OpenPI MeanFlow noise_method must be 'flow_ode' or "
+                f"'flow_noise', got {sample_method!r}."
+            )
+        return x_t_mean, x_t_std, value_t, v_t
+
+    def get_suffix_out(
+        self,
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        timestep,
+        r_timestep,
+    ):
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.embed_suffix(state, x_t, timestep, r_timestep)
+        )
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+            batch_size, suffix_len, prefix_len
+        )
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
+            "eager"  # noqa: SLF001
+        )
+
+        outputs_embeds, _ = self.paligemma_with_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+        suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        return suffix_out.to(dtype=torch.float32)
+
+    def get_velocity(
+        self,
+        state,
+        x_t,
+        timestep,
+        r_timestep,
+        prefix_pad_masks,
+        past_key_values,
+    ):
+        suffix_out = self.get_suffix_out(
+            state, prefix_pad_masks, past_key_values, x_t, timestep, r_timestep
+        )
+        return self.action_out_proj(suffix_out), suffix_out
+
+    def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks):
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_output, prefix_pad_masks, past_key_values
+
+    def _compute_value_from_suffix(self, suffix_out):
+        if self.config.chunk_critic_input:
+            suffix_out_value = torch.mean(
+                suffix_out[:, : self.config.action_chunk], dim=1, keepdim=False
+            )
+        else:
+            suffix_out_value = torch.mean(suffix_out, dim=1, keepdim=False)
+        if self.config.detach_critic_input:
+            suffix_out_value = suffix_out_value.detach()
+        return self.value_head(suffix_out_value)[:, 0]
+
+    def get_logprob_norm(self, sample, mu, sigma):
+        if self.config.safe_get_logprob:
+            return -torch.pow((sample - mu), 2)
+        mask = sigma == 0
+        sigma_safe = torch.where(mask, torch.ones_like(sigma), sigma)
+        constant_term = -torch.log(sigma_safe) - 0.5 * torch.log(
+            2 * torch.pi * torch.ones_like(sample)
+        )
+        exponent_term = -0.5 * torch.pow((sample - mu) / sigma_safe, 2)
+        log_prob = constant_term + exponent_term
+        return torch.where(mask, torch.zeros_like(log_prob), log_prob)
+
+    def preprocess_for_train(self, data):
+        return data
+
+    def get_log_prob_value(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        chains,
+        denoise_inds,
+        compute_values=False,
+    ):
+        bsize = state.shape[0]
+        batch_indices = torch.arange(bsize, device=state.device)
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        chains_log_probs = []
+        chains_values = []
+        chains_entropy = []
+
+        if self.config.joint_logprob:
+            num_steps = self.config.num_steps
+            initial_log_prob = self.get_logprob_norm(
+                chains[:, 0],
+                torch.zeros_like(chains[:, 0]),
+                torch.ones_like(chains[:, 0]),
+            )
+            initial_entropy = self.gaussian_entropy(torch.ones_like(chains[:, 0]))
+            chains_log_probs.append(initial_log_prob)
+            chains_entropy.append(initial_entropy)
+        else:
+            num_steps = 1
+
+        active_denoise_inds = denoise_inds[:, :num_steps].to(
+            device=state.device, dtype=torch.long
+        )
+        invalid_denoise_inds = (active_denoise_inds < 0) | (
+            active_denoise_inds >= self.config.num_steps
+        )
+        if torch.any(invalid_denoise_inds).item():
+            raise ValueError(
+                "denoise_inds must be in "
+                f"[0, {self.config.num_steps - 1}] for log-prob recomputation."
+            )
+
+        for idx in range(num_steps):
+            denoise_ind = active_denoise_inds[:, idx]
+            chains_pre = chains[batch_indices, denoise_ind]
+            chains_next = chains[batch_indices, denoise_ind + 1]
+            x_t_mean, x_t_std, value_t, _ = self.sample_mean_var_val(
+                chains_pre,
+                denoise_ind,
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                self.config.noise_method,
+                self.config.num_steps,
+                compute_values,
+            )
+            log_probs = self.get_logprob_norm(chains_next, x_t_mean, x_t_std)
+            entropy = self.gaussian_entropy(x_t_std)
+            chains_log_probs.append(log_probs)
+            chains_entropy.append(entropy)
+            if not self.use_vlm_value:
+                chains_values.append(value_t)
+
+        if self.use_vlm_value:
+            chains_values.append(self.get_value_from_vlm(prefix_output))
+        chains_log_probs = torch.stack(chains_log_probs, dim=1)
+        chains_values = torch.stack(chains_values, dim=1)
+
+        if self.config.noise_method == "flow_noise":
+            chains_entropy = torch.stack(chains_entropy, dim=1)
+        else:
+            chains_entropy = torch.zeros_like(chains_log_probs)
+        return chains_log_probs, chains_values, chains_entropy
+
+    def get_value_from_vlm(self, prefix_output):
+        if "pi05_" in self.config.config_name:
+            lang_token_len = 200
+            all_token_length = 968
+        elif "pi0_" in self.config.config_name:
+            lang_token_len = 48
+            all_token_length = 816
+        else:
+            lang_token_len = 200 if getattr(self, "pi05", True) else 48
+            all_token_length = 968 if getattr(self, "pi05", True) else 816
+
+        if self.config.value_vlm_mode == "mean_token":
+            prefix_mask = (
+                [True] * 256 * self.config.num_images_in_input
+                + [False] * 256 * (3 - self.config.num_images_in_input)
+                + [True] * lang_token_len
+            )
+        elif self.config.value_vlm_mode == "last_token":
+            prefix_mask = [False] * (all_token_length - 1) + [True]
+        elif self.config.value_vlm_mode == "first_token":
+            prefix_mask = [True] + [False] * (all_token_length - 1)
+        else:
+            raise ValueError(f"Invalid value_vlm_mode: {self.config.value_vlm_mode}")
+        prefix_out_value = prefix_output[:, prefix_mask, :]
+        prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
+        prefix_out_value = prefix_out_value.to(dtype=torch.float32)
+        return self.value_head(prefix_out_value)[:, 0]
+
+    def gaussian_entropy(self, sigma):
+        mask = sigma == 0
+        sigma_safe = torch.where(mask, torch.ones_like(sigma), sigma)
+        return 0.5 * torch.log(2 * math.pi * math.e * (sigma_safe**2))
+
+    def freeze_vlm(self):
+        if not self.config.train_expert_only:
+            return
+        self.paligemma_with_expert.paligemma.eval()
+        frozen_params = 0
+        for params in self.paligemma_with_expert.paligemma.parameters():
+            params.requires_grad = False
+            frozen_params += params.numel()
+        self.logger.info(
+            "[MeanFlow] Frozen VLM parameters; action expert and MeanFlow "
+            "heads remain trainable. frozen_params=%s",
+            f"{frozen_params:,}",
+        )
+
+
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     """
     Pi0 model for reinforcement learning action prediction.
@@ -153,7 +926,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     ):
         # Override `sample_actions` to prevent parent class polymorphic call
         sample_actions_func = self.sample_actions
-        super().__init__(config)
+        _run_without_torch_compile(lambda: PI0Pytorch.__init__(self, config))
         self.sample_actions = sample_actions_func
         self.logger = get_logger()
         self.global_step = 0
@@ -369,27 +1142,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if hasattr(self, "gradient_checkpointing_disable"):
             self.gradient_checkpointing_disable()
 
-        if isinstance(data, tuple):
-            observation, actions = data
-        else:
-            observation = data["observation"]
-            actions = data["actions"]
-
         device = next(self.parameters()).device
-        register_pytree_dataclasses(observation)
-        observation = tree_map(
-            lambda x: (
-                torch.as_tensor(x, device=device).contiguous().clone()
-                if x is not None
-                else x
-            ),
-            observation,
-        )
-        if not isinstance(actions, torch.Tensor):
-            actions = torch.as_tensor(actions, device=device)
-        else:
-            actions = actions.to(device=device)
-        actions = actions.to(dtype=torch.float32)
+        observation, actions = _prepare_openpi_sft_batch(data, device)
 
         # PI0Pytorch.forward returns per-element MSE (reduction="none").
         if self.config.use_rlt:

@@ -22,6 +22,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.fsdp import StateDictType
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -63,9 +64,49 @@ class Checkpoint(Stateful):
             for opt, opt_sd in zip(self.optimizers, optim_state_dicts):
                 opt.load_state_dict(opt_sd)
 
+    def _get_trainable_model_state_dict(self):
+        return {
+            name: param.detach().cpu().clone()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+
+    def _load_trainable_model_state_dict(self, model_state_dict):
+        named_params = dict(self.model.named_parameters())
+        unexpected = []
+        for name, value in model_state_dict.items():
+            param = named_params.get(name)
+            if param is None:
+                unexpected.append(name)
+                continue
+            param.data.copy_(value.to(device=param.device, dtype=param.dtype))
+        if unexpected:
+            raise KeyError(
+                f"Trainable checkpoint has unexpected parameters: {unexpected[:20]}"
+            )
+
     def state_dict(self):
-        if self.checkpoint_format == "local_shard":
-            model_sd = self.model.state_dict()
+        if self.checkpoint_format == "trainable_only":
+            model_sd = self._get_trainable_model_state_dict()
+            optim_sd = self._get_local_optim_state_dicts()
+
+            lr_sched_sd = [lr.state_dict() for lr in self.lr_schedulers]
+
+            out = {
+                "model": model_sd,
+                "optimizers": optim_sd,
+                "lr_schedulers": lr_sched_sd,
+                "fsdp_version": self.fsdp_version.value,
+                "rng": get_rng_state(),
+            }
+        elif self.checkpoint_format == "local_shard":
+            if self.fsdp_version == FSDPVersion.FSDP:
+                with FSDP.state_dict_type(
+                    self.model, state_dict_type=StateDictType.LOCAL_STATE_DICT
+                ):
+                    model_sd = self.model.state_dict()
+            else:
+                model_sd = self.model.state_dict()
             model_sd = {
                 key: to_local_if_dtensor(value).cpu()
                 if isinstance(value, torch.Tensor)
@@ -109,7 +150,12 @@ class Checkpoint(Stateful):
                 f"FSDP version mismatch: {ckpt_fsdp_version} != {self.fsdp_version}"
             )
 
-        if self.checkpoint_format == "local_shard":
+        if self.checkpoint_format == "trainable_only":
+            self._load_trainable_model_state_dict(state["model"])
+
+            self._load_local_optim_state_dicts(state["optimizers"])
+
+        elif self.checkpoint_format == "local_shard":
             self.model.load_state_dict(state["model"])
 
             self._load_local_optim_state_dicts(state["optimizers"])
