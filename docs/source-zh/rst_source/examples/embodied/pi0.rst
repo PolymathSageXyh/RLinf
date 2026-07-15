@@ -314,6 +314,13 @@ env** 之间的流水线重叠，从而提升 rollout 效率。
 
 例如，针对 flow-sde 的完整参数设置，可以参考 ``libero_spatial_ppo_openpi.yaml``；针对 flow-noise 的完整参数设置，可以参考 ``maniskill_ppo_openpi.yaml``。
 
+PI0-MeanFlow 同样支持 ``flow_sde`` 采样。需要显式设置
+``noise_method: "flow_sde"``，并保持 ``joint_logprob: True``，从而在策略
+log-probability 重计算中包含初始高斯先验和全部去噪转移。``noise_level``
+控制固定的 SDE 强度；``noise_logvar_range`` 按照
+``[min_std, max_std]`` 解释，用于截断最终的去噪标准差。当前实现不为
+Flow-SDE 提供 entropy bonus，因此应保持 ``algorithm.entropy_bonus: 0``。
+
 **2.3 LoRA设置**
 
 .. code:: yaml

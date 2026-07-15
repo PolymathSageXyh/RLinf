@@ -327,6 +327,14 @@ In the paper, we provide two technical approaches, flow-noise and flow-sde, to f
 
 For example, for complete parameter settings of flow-sde, please refer to ``libero_spatial_ppo_openpi.yaml``; for complete parameter settings of flow-noise, please refer to ``maniskill_ppo_openpi.yaml``.
 
+PI0-MeanFlow also supports ``flow_sde`` sampling. Set
+``noise_method: "flow_sde"`` explicitly and keep ``joint_logprob: True`` to
+include the initial Gaussian prior and all denoising transitions in policy
+log-probability recomputation. ``noise_level`` controls the fixed SDE strength,
+while ``noise_logvar_range`` is interpreted as ``[min_std, max_std]`` and clips
+the resulting denoising standard deviation. Flow-SDE does not expose an entropy
+bonus in the current implementation, so keep ``algorithm.entropy_bonus: 0``.
+
 **2.3 LoRA Settings**
 
 .. code:: yaml

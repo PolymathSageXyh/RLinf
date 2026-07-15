@@ -17,7 +17,13 @@ from rlinf.models.embodiment.openpi.openpi_action_model import (  # noqa: E402
 )
 
 
-def _make_policy(noise_method: str, *, joint_logprob: bool = False):
+def _make_policy(
+    noise_method: str,
+    *,
+    joint_logprob: bool = False,
+    noise_level: float = 0.5,
+    noise_logvar_range: tuple[float, float] = (0.08, 0.16),
+):
     policy = object.__new__(OpenPi0MeanFlowForRLActionPrediction)
     torch.nn.Module.__init__(policy)
     policy.config = SimpleNamespace(
@@ -31,6 +37,8 @@ def _make_policy(noise_method: str, *, joint_logprob: bool = False):
         detach_critic_input=False,
         ignore_last=False,
         joint_logprob=joint_logprob,
+        noise_level=noise_level,
+        noise_logvar_range=list(noise_logvar_range),
         noise_method=noise_method,
         num_steps=2,
         safe_get_logprob=False,
@@ -44,7 +52,7 @@ def _make_policy(noise_method: str, *, joint_logprob: bool = False):
         out_dim=2,
         hidden_dims=[8],
         activation_type="tanh",
-        noise_logvar_range=[0.08, 0.16],
+        noise_logvar_range=list(noise_logvar_range),
         noise_scheduler_type="learn",
     )
 
@@ -75,6 +83,7 @@ def test_meanflow_config_uses_noise_method_instead_of_add_noise_head():
     config_fields = {field.name for field in dataclasses.fields(OpenPi0MeanFlowConfig)}
     assert "add_noise_head" not in config_fields
     assert OpenPi0MeanFlowConfig().noise_method == "flow_ode"
+    assert OpenPi0MeanFlowConfig().noise_level == 0.5
     assert OpenPi0MeanFlowConfig().joint_logprob is True
 
 
@@ -95,6 +104,8 @@ def test_noise_head_construction_and_fsdp_registration_follow_noise_method(
     common_config = {
         "action_dim": 2,
         "add_value_head": False,
+        "double_layer": False,
+        "joint_logprob": True,
         "noise_logvar_range": [0.08, 0.16],
         "train_expert_only": True,
         "value_after_vlm": False,
@@ -105,11 +116,16 @@ def test_noise_head_construction_and_fsdp_registration_follow_noise_method(
     ode_policy = OpenPi0MeanFlowForRLActionPrediction(
         SimpleNamespace(noise_method="flow_ode", **common_config)
     )
+    sde_policy = OpenPi0MeanFlowForRLActionPrediction(
+        SimpleNamespace(noise_method="flow_sde", noise_level=0.5, **common_config)
+    )
 
     assert hasattr(noise_policy, "noise_head")
     assert "ExploreNoiseNet" in noise_policy._no_split_modules
     assert not hasattr(ode_policy, "noise_head")
     assert "ExploreNoiseNet" not in ode_policy._no_split_modules
+    assert not hasattr(sde_policy, "noise_head")
+    assert "ExploreNoiseNet" not in sde_policy._no_split_modules
 
 
 def test_flow_ode_is_deterministic_with_zero_logprob_and_entropy():
@@ -171,6 +187,86 @@ def test_flow_noise_rollout_recompute_matches_and_backpropagates():
     assert any(torch.count_nonzero(grad) > 0 for grad in noise_grads)
 
 
+def test_flow_sde_matches_reference_formula_and_flow_noise_shapes():
+    policy = _make_policy(
+        "flow_sde",
+        noise_level=0.5,
+        noise_logvar_range=(0.01, 2.0),
+    )
+    x_t = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2) / 4.0
+    state = torch.zeros(2, 2)
+    denoise_inds = torch.tensor([0, 1])
+
+    x_t_mean, x_t_std, _, v_t = policy.sample_mean_var_val(
+        x_t, denoise_inds, state, None, None, "flow_sde", 2
+    )
+    flow_noise_mean, flow_noise_std, _, _ = policy.sample_mean_var_val(
+        x_t, denoise_inds, state, None, None, "flow_noise", 2
+    )
+
+    timestep = torch.tensor([1.0, 0.5])
+    r_timestep = torch.tensor([0.5, 0.0])
+    safe_timestep = torch.tensor([0.99, 0.5])
+    midpoint = (timestep + r_timestep) / 2.0
+    log1p_diff = torch.log1p(-r_timestep) - torch.log1p(-safe_timestep)
+    log1p_diff_mid = torch.log1p(-r_timestep) - torch.log1p(-midpoint)
+    time_diff = timestep - r_timestep
+    noise_level_sq = torch.tensor(0.5).square()
+
+    expected_mean = x_t * (
+        1.0 - noise_level_sq / 2.0 * log1p_diff[:, None, None]
+    ) - time_diff[:, None, None] * v_t * (
+        1.0 + noise_level_sq / 2.0 * (1.0 - log1p_diff_mid[:, None, None])
+    )
+    expected_std = torch.sqrt(
+        (noise_level_sq * (log1p_diff - time_diff)).clamp_min(0.0)
+    )[:, None, None].expand_as(x_t)
+
+    assert x_t_mean.shape == flow_noise_mean.shape == x_t.shape
+    assert x_t_std.shape == flow_noise_std.shape == x_t.shape
+    assert x_t_mean.dtype == x_t.dtype
+    assert x_t_std.dtype == x_t.dtype
+    torch.testing.assert_close(x_t_mean, expected_mean)
+    torch.testing.assert_close(x_t_std, expected_std)
+    assert torch.isfinite(x_t_mean).all()
+    assert torch.isfinite(x_t_std).all()
+
+
+def test_flow_sde_std_is_clamped_to_configured_bounds():
+    x_t = torch.ones(2, 2, 2)
+    state = torch.zeros(2, 2)
+
+    low_policy = _make_policy("flow_sde", noise_level=0.0)
+    _, low_std, _, _ = low_policy.sample_mean_var_val(
+        x_t, 0, state, None, None, "flow_sde", 2
+    )
+    torch.testing.assert_close(low_std, torch.full_like(x_t, 0.08))
+
+    high_policy = _make_policy("flow_sde", noise_level=1.0)
+    _, high_std, _, _ = high_policy.sample_mean_var_val(
+        x_t, 0, state, None, None, "flow_sde", 2
+    )
+    torch.testing.assert_close(high_std, torch.full_like(x_t, 0.16))
+
+
+@pytest.mark.parametrize(
+    ("noise_level", "noise_range", "error"),
+    [
+        (-0.1, (0.08, 0.16), "noise_level"),
+        (0.5, (0.0, 0.16), "noise_logvar_range"),
+        (0.5, (0.2, 0.1), "noise_logvar_range"),
+    ],
+)
+def test_flow_sde_rejects_invalid_noise_config(noise_level, noise_range, error):
+    policy = _make_policy(
+        "flow_sde",
+        noise_level=noise_level,
+        noise_logvar_range=noise_range,
+    )
+    with pytest.raises(ValueError, match=error):
+        policy._validate_flow_sde_config()
+
+
 def test_joint_flow_noise_recomputes_full_chain_and_backpropagates():
     policy = _make_policy("flow_noise", joint_logprob=True)
     state = torch.zeros(2, 2)
@@ -214,6 +310,53 @@ def test_joint_flow_noise_recomputes_full_chain_and_backpropagates():
         parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
         for parameter in policy.noise_head.parameters()
     )
+
+
+def test_joint_flow_sde_recomputes_full_chain_with_zero_entropy():
+    policy = _make_policy(
+        "flow_sde",
+        joint_logprob=True,
+        noise_logvar_range=(0.01, 2.0),
+    )
+    state = torch.zeros(2, 2)
+    chain_states = [torch.ones(2, 2, 2)]
+    expected_log_probs = [
+        policy.get_logprob_norm(
+            chain_states[0],
+            torch.zeros_like(chain_states[0]),
+            torch.ones_like(chain_states[0]),
+        )
+    ]
+
+    for idx in range(policy.config.num_steps):
+        mean, std, _, _ = policy.sample_mean_var_val(
+            chain_states[-1], idx, state, None, None, "flow_sde", 2
+        )
+        sampled_next = (mean + 0.5 * std).detach()
+        expected_log_probs.append(
+            policy.get_logprob_norm(sampled_next, mean.detach(), std.detach())
+        )
+        chain_states.append(sampled_next)
+
+    log_probs, values, entropy = policy.get_log_prob_value(
+        None,
+        None,
+        None,
+        None,
+        state,
+        torch.stack(chain_states, dim=1),
+        torch.arange(2).repeat(2, 1),
+    )
+
+    torch.testing.assert_close(log_probs, torch.stack(expected_log_probs, dim=1))
+    assert log_probs.shape == entropy.shape == (2, 3, 2, 2)
+    assert values.shape == (2, 2)
+    torch.testing.assert_close(entropy, torch.zeros_like(log_probs))
+    assert torch.isfinite(log_probs).all()
+
+    (-log_probs.mean()).backward()
+    assert policy.velocity_scale.grad is not None
+    assert torch.count_nonzero(policy.velocity_scale.grad) > 0
 
 
 def test_joint_flow_ode_keeps_only_initial_prior_logprob():
@@ -277,7 +420,7 @@ def _install_rollout_stubs(policy, observed_methods):
             compute_values,
         )
         observed_methods.append(sample_method)
-        if sample_method == "flow_noise":
+        if sample_method in {"flow_noise", "flow_sde"}:
             std = torch.full_like(x_t, 0.25)
         else:
             std = torch.zeros_like(x_t)
@@ -312,18 +455,17 @@ def test_non_joint_rollout_uses_configured_noise_once_and_eval_is_ode(monkeypatc
     )
 
 
-def test_joint_rollout_uses_noise_at_every_step_and_eval_keeps_prior():
-    policy = _make_policy("flow_noise", joint_logprob=True)
+@pytest.mark.parametrize("noise_method", ["flow_noise", "flow_sde"])
+def test_joint_rollout_uses_noise_at_every_step_and_eval_keeps_prior(noise_method):
+    policy = _make_policy(noise_method, joint_logprob=True)
     policy.config.num_steps = 3
     observed_methods = []
     _install_rollout_stubs(policy, observed_methods)
     observation = SimpleNamespace(state=torch.zeros(2, 2))
 
     train_outputs = policy.sample_actions(observation, mode="train")
-    assert observed_methods == ["flow_noise", "flow_noise", "flow_noise"]
-    assert torch.equal(
-        train_outputs["denoise_inds"], torch.arange(3).repeat(2, 1)
-    )
+    assert observed_methods == [noise_method, noise_method, noise_method]
+    assert torch.equal(train_outputs["denoise_inds"], torch.arange(3).repeat(2, 1))
     assert train_outputs["chains"].shape == (2, 4, 2, 2)
     assert torch.isfinite(train_outputs["prev_logprobs"]).all()
 
@@ -338,9 +480,7 @@ def test_joint_rollout_uses_noise_at_every_step_and_eval_keeps_prior():
         torch.zeros_like(eval_outputs["chains"][:, 0]),
         torch.ones_like(eval_outputs["chains"][:, 0]),
     )
-    torch.testing.assert_close(
-        eval_outputs["prev_logprobs"], expected_prior / 4
-    )
+    torch.testing.assert_close(eval_outputs["prev_logprobs"], expected_prior / 4)
 
 
 def test_invalid_denoise_index_raises():
@@ -359,7 +499,9 @@ def test_invalid_denoise_index_raises():
 
 def test_forward_dispatches_only_default_and_sft():
     policy = _make_policy("flow_ode")
-    policy.default_forward = MethodType(lambda self, **kwargs: ("default", kwargs), policy)
+    policy.default_forward = MethodType(
+        lambda self, **kwargs: ("default", kwargs), policy
+    )
     policy.sft_forward = MethodType(lambda self, **kwargs: ("sft", kwargs), policy)
 
     assert policy.forward(ForwardType.DEFAULT, value=1) == ("default", {"value": 1})
@@ -414,14 +556,14 @@ def test_sft_forward_returns_scalar_and_rejects_chunk_loss(monkeypatch):
 
 
 def test_unsupported_meanflow_noise_method_raises():
-    policy = _make_policy("flow_sde")
-    with pytest.raises(ValueError, match="flow_ode.*flow_noise"):
+    policy = _make_policy("invalid")
+    with pytest.raises(ValueError, match="flow_ode.*flow_sde.*flow_noise"):
         policy.sample_mean_var_val(
             torch.ones(2, 2, 2),
             0,
             torch.zeros(2, 2),
             None,
             None,
-            "flow_sde",
+            "invalid",
             2,
         )

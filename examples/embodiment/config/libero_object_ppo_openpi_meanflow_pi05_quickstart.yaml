@@ -1,6 +1,6 @@
 defaults:
-  - env/libero_spatial@env.train
-  - env/libero_spatial@env.eval
+  - env/libero_object@env.train
+  - env/libero_object@env.eval
   - model/pi0_meanflow@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
@@ -23,7 +23,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_ppo_openpi_meanflow_pi05_quickstart_final"
+    experiment_name: "libero_object_ppo_openpi_meanflow_pi05_quickstart"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 1000
@@ -33,7 +33,7 @@ runner:
   val_check_interval: -1
   save_interval: 100
 
-  resume_dir: "/buaa/xyh/xyh/RLinf/logs/20260711-07:34:33-libero_spatial_ppo_openpi_meanflow_pi05_quickstart/libero_spatial_ppo_openpi_meanflow_pi05_quickstart_final/checkpoints/global_step_600"
+  resume_dir: null
   ckpt_path: null
 
 algorithm:

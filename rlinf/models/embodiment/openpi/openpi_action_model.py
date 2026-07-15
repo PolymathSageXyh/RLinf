@@ -48,7 +48,9 @@ except ImportError as exc:
 else:
     _PI0_MEANFLOW_IMPORT_ERROR = None
 
-_Pi0MeanflowConfigBase = Pi0MeanflowConfig if Pi0MeanflowConfig is not None else Pi0Config
+_Pi0MeanflowConfigBase = (
+    Pi0MeanflowConfig if Pi0MeanflowConfig is not None else Pi0Config
+)
 _PI0PytorchMeanflowBase = (
     PI0PytorchMeanflow if PI0PytorchMeanflow is not None else torch.nn.Module
 )
@@ -175,7 +177,8 @@ class OpenPi0MeanFlowConfig(_Pi0MeanflowConfigBase):
     num_steps: int = 10
     train_expert_only: bool = False
     meanflow_init_scope: str = "all_compatible"
-    noise_method: str = "flow_noise"
+    noise_method: str = "flow_ode"
+    noise_level: float = 0.5
     noise_logvar_range: list = field(default_factory=lambda: [0.08, 0.16])
     safe_get_logprob: bool = False
     joint_logprob: bool = True
@@ -236,14 +239,18 @@ class OpenPi0MeanFlowForRLActionPrediction(_PI0PytorchMeanflowBase, BasePolicy):
                 "openpi.models_pytorch.pi0_pytorch_meanflow.PI0PytorchMeanflow."
             ) from _PI0_MEANFLOW_IMPORT_ERROR
         sample_actions_func = self.sample_actions
-        _run_without_torch_compile(lambda: _PI0PytorchMeanflowBase.__init__(self, config))
+        _run_without_torch_compile(
+            lambda: _PI0PytorchMeanflowBase.__init__(self, config)
+        )
         self.sample_actions = sample_actions_func
         self.logger = get_logger()
         self.global_step = 0
-         # assert
+        # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
         )
+        if self.config.noise_method == "flow_sde":
+            self._validate_flow_sde_config()
 
         suffix_width = self.action_out_proj.in_features
         proj_width = 2048 if self.config.value_after_vlm else suffix_width
@@ -294,8 +301,7 @@ class OpenPi0MeanFlowForRLActionPrediction(_PI0PytorchMeanflowBase, BasePolicy):
             return self.default_forward(**kwargs)
         else:
             raise NotImplementedError(
-                "OpenPI MeanFlow supports only ForwardType.SFT and "
-                "ForwardType.DEFAULT."
+                "OpenPI MeanFlow supports only ForwardType.SFT and ForwardType.DEFAULT."
             )
 
     def sft_forward(self, data, use_action_chunk_loss: bool = False, **kwargs):
@@ -616,7 +622,7 @@ class OpenPi0MeanFlowForRLActionPrediction(_PI0PytorchMeanflowBase, BasePolicy):
         denoise_steps,
         compute_values=True,
     ):
-        """Compute one MeanFlow transition for flow_ode or flow_noise."""
+        """Compute one MeanFlow transition for the configured sampling method."""
         bsize = state.shape[0]
         device = state.device
         if isinstance(idx, int):
@@ -644,14 +650,81 @@ class OpenPi0MeanFlowForRLActionPrediction(_PI0PytorchMeanflowBase, BasePolicy):
         x_t_mean = x_t + dt * v_t
         if sample_method == "flow_ode":
             x_t_std = torch.zeros_like(x_t_mean)
+        elif sample_method == "flow_sde":
+            noise_level, min_std, max_std = self._validate_flow_sde_config()
+            timestep = timestep.to(device=x_t.device, dtype=x_t.dtype)
+            r_timestep = r_timestep.to(device=x_t.device, dtype=x_t.dtype)
+            safe_timestep = torch.where(
+                timestep >= 1.0,
+                torch.full_like(timestep, 0.99),
+                timestep,
+            )
+            midpoint = (timestep + r_timestep) / 2.0
+
+            log1p_diff = torch.log1p(-r_timestep) - torch.log1p(-safe_timestep)
+            log1p_diff_mid = torch.log1p(-r_timestep) - torch.log1p(-midpoint)
+            time_diff = timestep - r_timestep
+
+            noise_level = torch.as_tensor(
+                noise_level, device=x_t.device, dtype=x_t.dtype
+            )
+            noise_level_sq = noise_level.square()
+            log1p_diff = log1p_diff[:, None, None]
+            log1p_diff_mid = log1p_diff_mid[:, None, None]
+            time_diff = time_diff[:, None, None]
+
+            sigma_integrate = noise_level_sq / 2.0 * log1p_diff
+            x_t_mean = x_t * (1.0 - sigma_integrate) - time_diff * v_t * (
+                1.0 + noise_level_sq / 2.0 * (1.0 - log1p_diff_mid)
+            )
+            sigma_std = torch.sqrt(
+                (noise_level_sq * (log1p_diff - time_diff)).clamp_min(0.0)
+            )
+            x_t_std = sigma_std.expand_as(x_t)
+            x_t_std = x_t_std.clamp(min=min_std, max=max_std)
         elif sample_method == "flow_noise":
             x_t_std = self.noise_head(suffix_out)
         else:
             raise ValueError(
-                "OpenPI MeanFlow noise_method must be 'flow_ode' or "
-                f"'flow_noise', got {sample_method!r}."
+                "OpenPI MeanFlow noise_method must be 'flow_ode', "
+                f"'flow_sde', or 'flow_noise', got {sample_method!r}."
             )
         return x_t_mean, x_t_std, value_t, v_t
+
+    def _validate_flow_sde_config(self) -> tuple[float, float, float]:
+        """Validate and return the fixed MeanFlow Flow-SDE noise settings."""
+        noise_level = float(self.config.noise_level)
+        if not math.isfinite(noise_level) or noise_level < 0:
+            raise ValueError(
+                "OpenPI MeanFlow noise_level must be finite and non-negative "
+                "for flow_sde, "
+                f"got {noise_level}."
+            )
+
+        try:
+            noise_range = list(self.config.noise_logvar_range)
+        except TypeError as exc:
+            raise ValueError(
+                "OpenPI MeanFlow noise_logvar_range must contain exactly "
+                "[min_std, max_std]."
+            ) from exc
+        if len(noise_range) != 2:
+            raise ValueError(
+                "OpenPI MeanFlow noise_logvar_range must contain exactly "
+                f"[min_std, max_std], got {noise_range!r}."
+            )
+        min_std, max_std = (float(noise_range[0]), float(noise_range[1]))
+        if (
+            not math.isfinite(min_std)
+            or not math.isfinite(max_std)
+            or min_std <= 0
+            or min_std > max_std
+        ):
+            raise ValueError(
+                "OpenPI MeanFlow noise_logvar_range must satisfy "
+                f"0 < min_std <= max_std, got {noise_range!r}."
+            )
+        return noise_level, min_std, max_std
 
     def get_suffix_out(
         self,

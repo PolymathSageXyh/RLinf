@@ -1,6 +1,6 @@
 defaults:
-  - env/libero_spatial@env.train
-  - env/libero_spatial@env.eval
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
   - model/pi0_meanflow@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
@@ -23,7 +23,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_ppo_openpi_meanflow_pi05_quickstart_final"
+    experiment_name: "libero_10_ppo_openpi_meanflow_pi05_quickstart"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 1000
@@ -33,7 +33,7 @@ runner:
   val_check_interval: -1
   save_interval: 100
 
-  resume_dir: "/buaa/xyh/xyh/RLinf/logs/20260711-07:34:33-libero_spatial_ppo_openpi_meanflow_pi05_quickstart/libero_spatial_ppo_openpi_meanflow_pi05_quickstart_final/checkpoints/global_step_600"
+  resume_dir: "/buaa/xyh/xyh/RLinf/logs/20260709-06:24:50-libero_10_ppo_openpi_meanflow_pi05_quickstart/libero_10_ppo_openpi_meanflow_pi05_quickstart/checkpoints/global_step_200"
   ckpt_path: null
 
 algorithm:
@@ -86,14 +86,14 @@ env:
 
   train:
     total_num_envs: 32
-    max_episode_steps: 240
-    max_steps_per_rollout_epoch: 240
+    max_episode_steps: 480
+    max_steps_per_rollout_epoch: 480
   eval:
     total_num_envs: 50
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 240
-    max_steps_per_rollout_epoch: 240
+    max_episode_steps: 480
+    max_steps_per_rollout_epoch: 480
     group_size: 1
     is_eval: True
     video_cfg:
