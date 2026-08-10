@@ -24,6 +24,8 @@ from rlinf.envs.libero.utils import get_libero_type
 from rlinf.envs.venv import (
     BaseVectorEnv,
     CloudpickleWrapper,
+    DummyEnvWorker,
+    DummyVectorEnv,
     EnvWorker,
     ShArray,
     SubprocEnvWorker,
@@ -209,3 +211,38 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         for j, i in enumerate(id):
             self.workers[i].reconfigure_env_fn(env_fns[j])
+
+
+class ReconfigureDummyEnvWorker(DummyEnvWorker):
+    """In-process LIBERO worker whose environment can be replaced."""
+
+    def reconfigure_env_fn(self, env_fn: Callable[[], gym.Env]) -> None:
+        self.env.close()
+        self.env = env_fn()
+        self._env_fn = env_fn
+
+
+class ReconfigureDummyEnv(DummyVectorEnv):
+    """Sequential LIBERO vector environment with reconfiguration support.
+
+    Keeping every EGL context in one process avoids cross-process context
+    switches on drivers where those switches can cause NVIDIA Xid 31/109.
+    """
+
+    def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
+        BaseVectorEnv.__init__(self, env_fns, ReconfigureDummyEnvWorker, **kwargs)
+
+    def reconfigure_env_fns(
+        self,
+        env_fns: list[Callable[[], gym.Env]],
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
+    ) -> None:
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if len(env_fns) != len(id):
+            raise ValueError(
+                f"Expected {len(id)} environment factories, got {len(env_fns)}."
+            )
+
+        for env_fn, env_id in zip(env_fns, id):
+            self.workers[env_id].reconfigure_env_fn(env_fn)

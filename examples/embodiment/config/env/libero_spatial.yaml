@@ -16,6 +16,10 @@ reward_coef: 1.0
 reset_gripper_open: True
 is_eval: False
 
+# Use one subprocess per environment by default. Set false to keep all EGL
+# contexts in the EnvWorker process on systems affected by EGL Xid 31/109.
+use_subproc_vector_env: True
+
 seed: 0
 group_size: 1
 use_fixed_reset_state_ids: True

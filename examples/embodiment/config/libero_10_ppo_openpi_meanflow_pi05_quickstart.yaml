@@ -16,15 +16,15 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: all
+    actor,env,rollout: 7
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_10_ppo_openpi_meanflow_pi05_quickstart"
-    logger_backends: ["wandb"] # wandb, swanlab
+    experiment_name: "libero_10_ppo_openpi_meanflow_pi05_quickstart_2NFE"
+    logger_backends: null # wandb, swanlab
 
   max_epochs: 1000
   max_steps: -1
@@ -33,8 +33,7 @@ runner:
   val_check_interval: -1
   save_interval: 100
 
-  resume_dir: "/buaa/xyh/xyh/RLinf/logs/20260709-06:24:50-libero_10_ppo_openpi_meanflow_pi05_quickstart/libero_10_ppo_openpi_meanflow_pi05_quickstart/checkpoints/global_step_200"
-  ckpt_path: null
+  resume_dir: "/nas/xyh/RLinf/logs/20260730-22:48:35-libero_10_ppo_openpi_meanflow_pi05_quickstart/libero_10_ppo_openpi_meanflow_pi05_quickstart_2NFE/checkpoints/global_step_400"
 
 algorithm:
   normalize_advantages: True
@@ -97,7 +96,7 @@ env:
     group_size: 1
     is_eval: True
     video_cfg:
-      save_video: True
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
@@ -109,7 +108,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/buaa/xyh/xyh/openpi/checkpoints/pi05_libero_meanflow_fewshot/pi05_libero_meanflow_fewshot_40/50000"
+    model_path: "/nas/xyh/checkpoints/50000"
     precision: ${actor.model.precision}
 
 actor:
@@ -121,10 +120,10 @@ actor:
   enable_offload: True
 
   model:
-    model_path: "/buaa/xyh/xyh/openpi/checkpoints/pi05_libero_meanflow_fewshot/pi05_libero_meanflow_fewshot_40/50000"
+    model_path: "/nas/xyh/checkpoints/50000"
     model_type: "openpi"
     num_action_chunks: 10
-    num_steps: 1
+    num_steps: 2
     add_value_head: True
     openpi:
       config_name: "pi05_libero_meanflow"

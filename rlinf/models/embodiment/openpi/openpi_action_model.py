@@ -717,12 +717,12 @@ class OpenPi0MeanFlowForRLActionPrediction(_PI0PytorchMeanflowBase, BasePolicy):
         if (
             not math.isfinite(min_std)
             or not math.isfinite(max_std)
-            or min_std <= 0
+            or min_std < 0
             or min_std > max_std
         ):
             raise ValueError(
                 "OpenPI MeanFlow noise_logvar_range must satisfy "
-                f"0 < min_std <= max_std, got {noise_range!r}."
+                f"0 <= min_std <= max_std, got {noise_range!r}."
             )
         return noise_level, min_std, max_std
 

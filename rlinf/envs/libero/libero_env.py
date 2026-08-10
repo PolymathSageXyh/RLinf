@@ -34,7 +34,7 @@ from rlinf.envs.libero.utils import (
     quat2axisangle,
     record_completed_episode_task_stats,
 )
-from rlinf.envs.libero.venv import ReconfigureSubprocEnv
+from rlinf.envs.libero.venv import ReconfigureDummyEnv, ReconfigureSubprocEnv
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 from rlinf.utils.logging import get_logger
 
@@ -148,10 +148,20 @@ class LiberoEnv(gym.Env):
 
     def _init_env(self):
         env_fns = self.get_env_fns()
-        self.env = ReconfigureSubprocEnv(env_fns)
+        self.use_subproc_vector_env = bool(
+            self.cfg.get("use_subproc_vector_env", True)
+        )
+        if self.use_subproc_vector_env:
+            self.env = ReconfigureSubprocEnv(env_fns)
+        else:
+            logger.info(
+                "Using the sequential LIBERO vector environment; all EGL "
+                "contexts stay in the EnvWorker process."
+            )
+            self.env = ReconfigureDummyEnv(env_fns)
 
-    def get_env_fns(self):
-        env_fn_params = self.get_env_fn_params()
+    def get_env_fns(self, env_idx=None):
+        env_fn_params = self.get_env_fn_params(env_idx)
         env_fns = []
 
         current_type_val = get_libero_type()
@@ -658,8 +668,11 @@ class LiberoEnv(gym.Env):
             if task_changed or not self.is_eval:
                 reconfig_env_idx.append(env_id)
         if reconfig_env_idx:
-            env_fn_params = self.get_env_fn_params(reconfig_env_idx)
-            self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
+            if self.use_subproc_vector_env:
+                env_fns = self.get_env_fn_params(reconfig_env_idx)
+            else:
+                env_fns = self.get_env_fns(reconfig_env_idx)
+            self.env.reconfigure_env_fns(env_fns, reconfig_env_idx)
         self.env.seed(self.seed * len(env_idx))
         self.env.reset(id=env_idx)
         variant = os.environ.get(

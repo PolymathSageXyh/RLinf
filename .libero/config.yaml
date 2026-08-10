@@ -1,0 +1,5 @@
+assets: /nas/xyh/RLinf/.venv/libero/libero/libero/./assets
+bddl_files: /nas/xyh/RLinf/.venv/libero/libero/libero/./bddl_files
+benchmark_root: /nas/xyh/RLinf/.venv/libero/libero/libero
+datasets: /nas/xyh/RLinf/.venv/libero/libero/libero/../datasets
+init_states: /nas/xyh/RLinf/.venv/libero/libero/libero/./init_files

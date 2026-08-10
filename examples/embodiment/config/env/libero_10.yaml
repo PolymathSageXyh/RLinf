@@ -16,6 +16,7 @@ reward_coef: 5.0
 # RLinf LiberoEnv specific settings
 reset_gripper_open: True
 is_eval: False
+use_subproc_vector_env: True
 
 seed: 0
 group_size: 1
