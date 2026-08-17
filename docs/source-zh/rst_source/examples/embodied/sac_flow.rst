@@ -61,7 +61,7 @@
    * - 真机
      - Franka Panda + RealSense —— 插销
      - RGB + 本体感知
-     - 6 维末端执行器位姿
+     - 6 维末端位姿（旧路径）或 7 维位姿 + 夹爪（BC 微调路径）
 
 SAC-Flow 工作原理
 ----------------------------------------
@@ -97,6 +97,62 @@ SAC-Flow 工作原理
 
 运行
 ----------------------------------------
+
+预训练 Flow-T：从 GELLO 演示到在线 SACFlow
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+RLinf 还提供一条显式启用的纯 PyTorch 路径，让行为克隆和在线 SACFlow 复用同一个
+``FlowPolicy`` 与 ``FlowTActor``：
+
+.. code-block:: text
+
+   realworld_collect_data_gello.yaml
+     ├─ collected_data/ → RollingLeRobotDataset → Flow BC
+     └─ demos/          → TrajectoryReplayBuffer → online SACFlow
+
+两份入口配置为：
+
+- ``examples/sft/config/franka_gello_flow_bc.yaml``：训练 Rectified Flow 或实验性的
+  Improved MeanFlow；
+- ``examples/embodiment/config/franka_sacflow_online_finetune.yaml``：先执行冻结锚点
+  warm-up，再进行在线 SACFlow。
+
+仓库中的示例默认选择 Improved MeanFlow。若要改为训练并微调 Rectified Flow，需要同时
+设置 ``flow_matching.objective: rectified_flow`` 和
+``flow_sampling.profile: rf_sacflow_sde_v1``，并设置
+``flow_sampling.flow_sde.field_source: instantaneous_velocity``；同时从
+``flow_sde`` 配置块中删除仅供 iMF 使用的 ``noise_std_range`` 和
+``safe_initial_time``。目标或 checkpoint 语义不匹配时，会在加载权重前直接报错。
+
+两份配置均使用 ``flow_actor_type: FlowTActor``、19 维状态、单动作块，以及包含夹爪的
+7 维 GELLO 动作。可移植 BC 产物由
+``actor/flow_actor/model_state_dict/full_weights.pt`` 和
+``actor/flow_actor/flow_actor_manifest.json`` 组成。通过 ``runner.resume_dir`` 恢复完整在线训练时，
+其优先级高于 actor-only 初始化。
+
+Improved MeanFlow 保持原生时间方向（``t=1`` 为噪声，``t=0`` 为动作），并用两个
+独立时间编码器为区间场提供条件。其 ODE、flow-noise 和 flow-SDE 采样器只查询相邻
+区间场 ``U(z, t_from, t_to)``。Flow-SDE transition 参照仓库内 OpenPI MeanFlow
+公式，但 Flow-T 实现不会导入或修改 ``openpi_action_model.py``。在线 rollout 使用
+随机采样，评估始终使用确定性 ODE。
+
+在线示例随机初始化 critic，将其硬拷贝为 target，令 alpha 从 0.2 开始，并按 50/50
+采样 online/demo buffer。前 10,000 个在线 transition 中，critic 正常更新，actor
+只接受 frozen-anchor 动作正则，alpha 保持不变；随后 actor loss 切换为 SACFlow
+路径密度目标加同一个锚点正则。比较 live actor 与 anchor 时，两者共享初始噪声与
+逐步噪声。
+
+iMF 接入与 Franka 部署都是工程扩展。SACFlow 论文附录 F 的实验在仿真中完成，
+因此真机运动前必须在 dummy 或硬件在环环境中验证 checkpoint 输出一致性、动作限幅、
+随机路径尺度和 warm-up 阶段。
+
+替换数据、checkpoint、机器人和目标位姿占位符后，依次执行：
+
+.. code-block:: bash
+
+   bash examples/embodiment/collect_data.sh realworld_collect_data_gello
+   bash examples/sft/run_vla_sft.sh franka_gello_flow_bc
+   bash examples/embodiment/run_embodiment.sh franka_sacflow_online_finetune
 
 **1. 配置文件**
 

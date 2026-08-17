@@ -15,6 +15,7 @@
 import dataclasses
 import importlib.util
 import logging
+import math
 import os
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Union
@@ -823,6 +824,390 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def _flow_cfg_mapping(value, name: str):
+    """Return a config mapping and reject scalar/list values."""
+    if value is None:
+        return {}
+    if not hasattr(value, "get"):
+        raise AssertionError(f"{name} must be a mapping")
+    return value
+
+
+def _flow_cfg_reject_unknown(value, allowed: set[str], name: str) -> None:
+    unknown = sorted(set(value.keys()) - allowed)
+    if unknown:
+        raise AssertionError(f"Unknown {name} keys: {unknown}")
+
+
+def _validate_flow_policy_v2_cfg(
+    model_cfg,
+    *,
+    task_type: str,
+    algorithm_cfg=None,
+    data_cfg=None,
+    resume_dir=None,
+) -> None:
+    """Validate the opt-in PyTorch Flow-T v2 contract.
+
+    Historical FlowPolicy YAMLs do not contain ``flow_matching`` and return
+    immediately. This keeps the legacy FlowTActor and JaxFlowTActor paths
+    numerically unchanged while making new RF/iMF configurations fail fast.
+    """
+    matching = _flow_cfg_mapping(model_cfg.get("flow_matching", None), "flow_matching")
+    sampling = _flow_cfg_mapping(model_cfg.get("flow_sampling", None), "flow_sampling")
+    pretrained = _flow_cfg_mapping(
+        model_cfg.get("pretrained_actor", None), "pretrained_actor"
+    )
+    if not matching and not sampling and not pretrained:
+        return
+    if not matching:
+        raise AssertionError(
+            "flow_sampling/pretrained_actor requires actor.model.flow_matching"
+        )
+
+    _flow_cfg_reject_unknown(
+        matching,
+        {
+            "implementation",
+            "objective",
+            "action_transform",
+            "rectified_flow",
+            "improved_meanflow",
+        },
+        "flow_matching",
+    )
+    if matching.get("implementation") != "pytorch_flow_t_v2":
+        raise AssertionError("flow_matching.implementation must be 'pytorch_flow_t_v2'")
+    if model_cfg.get("flow_actor_type") != "FlowTActor":
+        raise AssertionError(
+            "PyTorch Flow-T v2 supports only actor.model.flow_actor_type=FlowTActor"
+        )
+    if str(model_cfg.get("input_type", "mixed")) != "mixed":
+        raise AssertionError(
+            "Franka + GELLO PyTorch Flow-T v2 requires actor.model.input_type=mixed"
+        )
+    if int(model_cfg.get("action_dim", -1)) != 7:
+        raise AssertionError(
+            "Franka + GELLO PyTorch Flow-T v2 requires actor.model.action_dim=7"
+        )
+    if int(model_cfg.get("state_dim", -1)) != 19:
+        raise AssertionError(
+            "Franka + GELLO PyTorch Flow-T v2 requires actor.model.state_dim=19"
+        )
+    if int(model_cfg.get("image_num", 1)) <= 0:
+        raise AssertionError(
+            "Franka + GELLO PyTorch Flow-T v2 requires actor.model.image_num>0"
+        )
+    if int(model_cfg.get("num_action_chunks", 1)) != 1:
+        raise AssertionError("PyTorch Flow-T v2 currently requires num_action_chunks=1")
+    if matching.get("action_transform", "tanh_latent") != "tanh_latent":
+        raise AssertionError("flow_matching.action_transform must be 'tanh_latent'")
+
+    objective = str(matching.get("objective", ""))
+    if objective not in {"rectified_flow", "improved_meanflow"}:
+        raise AssertionError(
+            "flow_matching.objective must be 'rectified_flow' or 'improved_meanflow'"
+        )
+
+    rf_cfg = _flow_cfg_mapping(
+        matching.get("rectified_flow", None), "flow_matching.rectified_flow"
+    )
+    _flow_cfg_reject_unknown(rf_cfg, set(), "rectified_flow")
+    imf_cfg = _flow_cfg_mapping(
+        matching.get("improved_meanflow", None),
+        "flow_matching.improved_meanflow",
+    )
+    _flow_cfg_reject_unknown(
+        imf_cfg,
+        {
+            "boundary_pair_probability",
+            "logit_mean",
+            "logit_std",
+            "adaptive_power",
+            "adaptive_epsilon",
+            "time_conditioning",
+        },
+        "flow_matching.improved_meanflow",
+    )
+    if objective == "improved_meanflow":
+        boundary_probability = float(imf_cfg.get("boundary_pair_probability", 0.5))
+        if not 0.0 <= boundary_probability <= 1.0:
+            raise AssertionError(
+                "improved_meanflow.boundary_pair_probability must be in [0, 1]"
+            )
+        time_conditioning = _flow_cfg_mapping(
+            imf_cfg.get("time_conditioning", {}),
+            "flow_matching.improved_meanflow.time_conditioning",
+        )
+        _flow_cfg_reject_unknown(
+            time_conditioning,
+            {"from_encoder", "to_encoder", "fusion"},
+            "improved_meanflow.time_conditioning",
+        )
+        expected_time_conditioning = {
+            "from_encoder": "independent_mlp",
+            "to_encoder": "independent_mlp",
+            "fusion": "concat_linear_2d_to_d",
+        }
+        for key, expected in expected_time_conditioning.items():
+            if time_conditioning.get(key) != expected:
+                raise AssertionError(
+                    f"improved_meanflow.time_conditioning.{key} must be {expected!r}"
+                )
+
+    for name, value in {
+        "logit_mean": imf_cfg.get("logit_mean", -0.4),
+        "logit_std": imf_cfg.get("logit_std", 1.0),
+        "adaptive_power": imf_cfg.get("adaptive_power", 1.0),
+        "adaptive_epsilon": imf_cfg.get("adaptive_epsilon", 0.01),
+    }.items():
+        if not math.isfinite(float(value)):
+            raise AssertionError(f"improved_meanflow.{name} must be finite")
+    if float(imf_cfg.get("logit_std", 1.0)) <= 0:
+        raise AssertionError("improved_meanflow.logit_std must be positive")
+    if float(imf_cfg.get("adaptive_epsilon", 0.01)) <= 0:
+        raise AssertionError("improved_meanflow.adaptive_epsilon must be positive")
+
+    if task_type == "sft":
+        if bool(model_cfg.get("add_q_head", False)):
+            raise AssertionError("Flow BC requires actor.model.add_q_head=false")
+        if pretrained:
+            raise AssertionError(
+                "Flow BC uses runner.resume_dir for resume; pretrained_actor is online-only"
+            )
+        if data_cfg is not None:
+            if str(data_cfg.get("format", "")) != "lerobot":
+                raise AssertionError(
+                    "Franka + GELLO Flow BC requires data.format=lerobot"
+                )
+            image_keys = list(data_cfg.get("image_keys", ["image"]))
+            if int(model_cfg.get("image_num", 1)) != len(image_keys):
+                raise AssertionError(
+                    "Flow BC requires actor.model.image_num to match data.image_keys"
+                )
+            image_range = str(data_cfg.get("image_value_range", "zero_one"))
+            if image_range not in {"zero_one", "auto"}:
+                raise AssertionError(
+                    "Franka + GELLO LeRobot data.image_value_range must be "
+                    "zero_one or auto"
+                )
+        return
+
+    if not sampling:
+        raise AssertionError("online Flow-T v2 requires actor.model.flow_sampling")
+    _flow_cfg_reject_unknown(
+        sampling,
+        {
+            "implementation",
+            "profile",
+            "actor_update",
+            "online_rollout",
+            "evaluation",
+            "flow_noise",
+            "flow_sde",
+        },
+        "flow_sampling",
+    )
+    if sampling.get("implementation") != "pytorch_flow_t_v2":
+        raise AssertionError("flow_sampling.implementation must be 'pytorch_flow_t_v2'")
+    expected_profile = {
+        "rectified_flow": "rf_sacflow_sde_v1",
+        "improved_meanflow": "imf_openpi_interval_sde_v1",
+    }[objective]
+    if sampling.get("profile") != expected_profile:
+        raise AssertionError(
+            f"{objective} requires flow_sampling.profile={expected_profile!r}"
+        )
+
+    methods: dict[str, str] = {}
+    for section_name in ("actor_update", "online_rollout", "evaluation"):
+        section = _flow_cfg_mapping(
+            sampling.get(section_name, None), f"flow_sampling.{section_name}"
+        )
+        if not section:
+            raise AssertionError(f"flow_sampling.{section_name} is required")
+        _flow_cfg_reject_unknown(
+            section,
+            {"method", "num_steps"},
+            f"flow_sampling.{section_name}",
+        )
+        method = str(section.get("method", ""))
+        if method not in {"flow_ode", "flow_noise", "flow_sde"}:
+            raise AssertionError(
+                f"flow_sampling.{section_name}.method must be flow_ode, "
+                "flow_noise, or flow_sde"
+            )
+        steps = int(section.get("num_steps", 0))
+        if steps <= 0 or steps >= 100:
+            raise AssertionError(
+                f"flow_sampling.{section_name}.num_steps must be in [1, 99]"
+            )
+        methods[section_name] = method
+    if methods["evaluation"] != "flow_ode":
+        raise AssertionError("flow_sampling.evaluation.method must be flow_ode")
+    if methods["online_rollout"] == "flow_ode":
+        raise AssertionError(
+            "SAC online_rollout requires stochastic flow_noise or flow_sde"
+        )
+    if methods["actor_update"] == "flow_ode":
+        raise AssertionError(
+            "SAC actor_update requires flow_noise or flow_sde, not singular flow_ode"
+        )
+
+    flow_sde = _flow_cfg_mapping(
+        sampling.get("flow_sde", None), "flow_sampling.flow_sde"
+    )
+    flow_noise = _flow_cfg_mapping(
+        sampling.get("flow_noise", None), "flow_sampling.flow_noise"
+    )
+    _flow_cfg_reject_unknown(
+        flow_noise,
+        {"noise_std_range"},
+        "flow_sampling.flow_noise",
+    )
+    if "flow_noise" in methods.values():
+        noise_range = list(flow_noise.get("noise_std_range", []))
+        if len(noise_range) != 2:
+            raise AssertionError("flow_noise.noise_std_range must contain [min, max]")
+        minimum, maximum = map(float, noise_range)
+        if not (
+            math.isfinite(minimum)
+            and math.isfinite(maximum)
+            and 0.0 < minimum <= maximum
+        ):
+            raise AssertionError(
+                "SAC flow_noise requires 0 < noise_std_range[0] <= noise_std_range[1]"
+            )
+    _flow_cfg_reject_unknown(
+        flow_sde,
+        {
+            "field_source",
+            "noise_level",
+            "noise_std_range",
+            "safe_initial_time",
+            "joint_path_logprob",
+        },
+        "flow_sampling.flow_sde",
+    )
+    if "flow_sde" in methods.values():
+        expected_source = (
+            "interval_average"
+            if objective == "improved_meanflow"
+            else "instantaneous_velocity"
+        )
+        if flow_sde.get("field_source") != expected_source:
+            raise AssertionError(
+                f"{objective} flow_sde.field_source must be {expected_source!r}"
+            )
+        noise_level = float(flow_sde.get("noise_level", 0.0))
+        if not math.isfinite(noise_level) or noise_level <= 0:
+            raise AssertionError("flow_sde.noise_level must be finite and positive")
+        if objective == "improved_meanflow":
+            noise_range = list(flow_sde.get("noise_std_range", []))
+            if len(noise_range) != 2:
+                raise AssertionError(
+                    "iMF flow_sde.noise_std_range must contain [min, max]"
+                )
+            minimum, maximum = map(float, noise_range)
+            if not (
+                math.isfinite(minimum)
+                and math.isfinite(maximum)
+                and 0.0 < minimum <= maximum
+            ):
+                raise AssertionError(
+                    "SAC iMF flow_sde requires 0 < noise_std_range[0] "
+                    "<= noise_std_range[1]"
+                )
+            safe_initial_time = float(flow_sde.get("safe_initial_time", 0.99))
+            if not 0.0 < safe_initial_time < 1.0:
+                raise AssertionError("flow_sde.safe_initial_time must be in (0, 1)")
+            sde_steps = [
+                int(sampling[section_name].get("num_steps"))
+                for section_name, method in methods.items()
+                if method == "flow_sde"
+            ]
+            if any(
+                safe_initial_time <= 1.0 - 1.0 / num_steps for num_steps in sde_steps
+            ):
+                raise AssertionError(
+                    "iMF flow_sde.safe_initial_time must be strictly greater "
+                    "than 1-1/num_steps for every SDE sampling section"
+                )
+        elif any(key in flow_sde for key in ("noise_std_range", "safe_initial_time")):
+            raise AssertionError(
+                "RF corrected flow_sde derives std from noise_level and step size; "
+                "remove iMF-only noise_std_range and safe_initial_time"
+            )
+        if not bool(flow_sde.get("joint_path_logprob", True)):
+            raise AssertionError("SACFlow v2 requires joint_path_logprob=true")
+
+    _flow_cfg_reject_unknown(
+        pretrained,
+        {"path", "load_mode", "require_manifest", "strict_actor"},
+        "pretrained_actor",
+    )
+    if resume_dir is None:
+        if not pretrained.get("path", None):
+            raise AssertionError(
+                "fresh online Flow-T v2 runs require pretrained_actor.path"
+            )
+        if pretrained.get("load_mode", "actor_only") != "actor_only":
+            raise AssertionError("pretrained_actor.load_mode must be actor_only")
+        if not bool(pretrained.get("require_manifest", True)):
+            raise AssertionError("new Flow-T v2 checkpoints require a manifest")
+    if not bool(pretrained.get("strict_actor", True)):
+        raise AssertionError("new Flow-T v2 checkpoints require strict_actor=true")
+
+    finetune = _flow_cfg_mapping(
+        (algorithm_cfg or {}).get("sacflow_finetune", None),
+        "algorithm.sacflow_finetune",
+    )
+    if not bool(finetune.get("enabled", False)):
+        raise AssertionError(
+            "online pretrained Flow-T v2 requires algorithm.sacflow_finetune.enabled=true"
+        )
+    _flow_cfg_reject_unknown(
+        finetune,
+        {
+            "enabled",
+            "warmup_transitions",
+            "behavior_beta",
+            "warmup_behavior_beta",
+            "demo_fraction",
+            "updates_per_transition",
+            "common_noise",
+        },
+        "algorithm.sacflow_finetune",
+    )
+    warmup_transitions = finetune.get("warmup_transitions", 10000)
+    if (
+        isinstance(warmup_transitions, bool)
+        or not isinstance(warmup_transitions, int)
+        or warmup_transitions < 0
+    ):
+        raise AssertionError(
+            "sacflow_finetune.warmup_transitions must be a non-negative integer"
+        )
+    for key in ("behavior_beta", "warmup_behavior_beta"):
+        value = float(finetune.get(key, finetune.get("behavior_beta", 1000.0)))
+        if not math.isfinite(value) or value < 0:
+            raise AssertionError(
+                f"sacflow_finetune.{key} must be finite and non-negative"
+            )
+    demo_fraction = float(finetune.get("demo_fraction", 0.5))
+    if not 0.0 <= demo_fraction <= 1.0:
+        raise AssertionError("sacflow_finetune.demo_fraction must be in [0, 1]")
+    updates_per_transition = finetune.get("updates_per_transition", 1)
+    if (
+        isinstance(updates_per_transition, bool)
+        or not isinstance(updates_per_transition, int)
+        or updates_per_transition != 1
+    ):
+        raise AssertionError("SACFlow fine-tuning requires updates_per_transition=1")
+    if not bool(finetune.get("common_noise", True)):
+        raise AssertionError("frozen-anchor regularization requires common_noise=true")
+
+
 def validate_embodied_cfg(cfg):
     only_eval = (
         cfg.runner.get("only_eval", False)
@@ -835,6 +1220,21 @@ def validate_embodied_cfg(cfg):
         f"Model type: '{model_cfg.model_type}' is not an embodied model. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
+    if model_type == SupportedModel.FLOW_POLICY:
+        _validate_flow_policy_v2_cfg(
+            model_cfg,
+            task_type="embodied",
+            algorithm_cfg=algorithm_cfg,
+            resume_dir=cfg.runner.get("resume_dir", None),
+        )
+        if model_cfg.get("flow_matching", None):
+            for split_name in ("train", "eval"):
+                split_cfg = cfg.env.get(split_name, None)
+                if split_cfg is not None and bool(split_cfg.get("no_gripper", False)):
+                    raise AssertionError(
+                        "Franka + GELLO Flow-T v2 uses 7-D actions and requires "
+                        f"env.{split_name}.no_gripper=false"
+                    )
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
     enable_eval = cfg.runner.val_check_interval > 0 or only_eval
@@ -1187,6 +1587,15 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
             cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
 
         model_type = cfg.actor.model.get("model_type", None)
+        if (
+            model_type is not None
+            and SupportedModel(model_type) == SupportedModel.FLOW_POLICY
+        ):
+            _validate_flow_policy_v2_cfg(
+                cfg.actor.model,
+                task_type="sft",
+                data_cfg=cfg.data,
+            )
         if (
             model_type is not None
             and SupportedModel(model_type) == SupportedModel.DREAMZERO

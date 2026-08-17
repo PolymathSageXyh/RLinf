@@ -1,0 +1,245 @@
+defaults:
+  - env/realworld_peg_insertion@env.train
+  - env/realworld_peg_insertion@env.eval
+  - model/flow_policy@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    actor:
+      node_group: "gpu"
+      placement: 0
+    rollout:
+      node_group: "gpu"
+      placement: 0
+    env:
+      node_group: "franka"
+      placement: 0
+  node_groups:
+    - label: "gpu"
+      node_ranks: 0
+    - label: "franka"
+      node_ranks: 1
+      hardware:
+        type: Franka
+        configs:
+          - robot_ip: ROBOT_IP
+            node_rank: 1
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "franka_sacflow_online_finetune"
+    logger_backends: ["tensorboard"]
+  max_epochs: 8000
+  max_steps: -1
+  only_eval: false
+  val_check_interval: -1
+  save_interval: 50
+  resume_dir: null
+
+algorithm:
+  update_epoch: 1
+  group_size: 1
+  normalize_advantages: false
+  reward_type: "action_level"
+  logprob_type: "action_level"
+  entropy_type: "action_level"
+  adv_type: "embodied_sac"
+  loss_type: "embodied_sac"
+  loss_agg_func: "token-mean"
+  bootstrap_type: "standard"
+
+  gamma: 0.99
+  tau: 0.005
+  agg_q: "min"
+  actor_agg_q: "mean"
+  critic_subsample_size: 2
+  critic_actor_ratio: 1
+  backup_entropy: true
+  target_update_freq: 1
+
+  entropy_tuning:
+    alpha_type: "softplus"
+    initial_alpha: 0.2
+    target_entropy: 0
+    optim:
+      lr: 3.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  sacflow_finetune:
+    enabled: true
+    warmup_transitions: 10000
+    warmup_behavior_beta: 1000.0
+    behavior_beta: 1000.0
+    demo_fraction: 0.5
+    updates_per_transition: 1
+    common_noise: true
+
+  replay_buffer:
+    enable_cache: true
+    cache_size: 2000
+    min_buffer_size: 2
+    sample_window_size: 2000
+    auto_save: true
+
+  demo_buffer:
+    enable_cache: true
+    cache_size: 2000
+    min_buffer_size: 1
+    sample_window_size: 0
+    load_path: "/path/to/franka_gello/demos"
+    auto_save: false
+
+env:
+  group_name: "EnvGroup"
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    use_spacemouse: false
+    no_gripper: false
+    ignore_terminations: false
+    auto_reset: false
+    max_steps_per_rollout_epoch: 1
+    override_cfg:
+      is_dummy: false
+      use_dense_reward: false
+      target_ee_pose: TARGET_EE_POSE
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    use_spacemouse: false
+    no_gripper: false
+    ignore_terminations: false
+    auto_reset: false
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: true
+  collect_prev_infos: false
+  model:
+    model_path: "/path/to/RLinf-ResNet10-pretrained"
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 256
+  global_batch_size: 256
+  seed: 1234
+  enable_offload: false
+  enable_drq: false
+
+  model:
+    model_type: "flow_policy"
+    input_type: "mixed"
+    image_size: [3, 128, 128]
+    image_num: 1
+    state_dim: 19
+    action_dim: 7
+    num_action_chunks: 1
+    action_scale: [-1.0, 1.0]
+
+    model_path: "/path/to/RLinf-ResNet10-pretrained"
+    encoder_config:
+      ckpt_name: "resnet10_pretrained.pt"
+    pretrained_actor:
+      # Portable artifact exported by franka_gello_flow_bc.yaml.
+      path: "/path/to/global_step_N/actor/flow_actor"
+      load_mode: "actor_only"
+      require_manifest: true
+      strict_actor: true
+
+    precision: "32"
+    backbone: "resnet"
+    add_value_head: false
+    add_q_head: true
+    num_q_heads: 10
+    q_head_type: "default"
+
+    flow_actor_type: "FlowTActor"
+    denoising_steps: 4
+    d_model: 256
+    n_head: 4
+    n_layers: 2
+    use_batch_norm: false
+    batch_norm_momentum: 0.99
+
+    flow_matching:
+      implementation: "pytorch_flow_t_v2"
+      objective: "improved_meanflow"
+      action_transform: "tanh_latent"
+      improved_meanflow:
+        boundary_pair_probability: 0.5
+        logit_mean: -0.4
+        logit_std: 1.0
+        adaptive_power: 1.0
+        adaptive_epsilon: 0.01
+        time_conditioning:
+          from_encoder: "independent_mlp"
+          to_encoder: "independent_mlp"
+          fusion: "concat_linear_2d_to_d"
+
+    flow_sampling:
+      implementation: "pytorch_flow_t_v2"
+      profile: "imf_openpi_interval_sde_v1"
+      actor_update:
+        method: "flow_sde"
+        num_steps: 4
+      online_rollout:
+        method: "flow_sde"
+        num_steps: 4
+      evaluation:
+        method: "flow_ode"
+        num_steps: 4
+      flow_sde:
+        field_source: "interval_average"
+        noise_level: 0.10
+        noise_std_range: [0.005, 0.05]
+        safe_initial_time: 0.99
+        joint_path_logprob: true
+
+    gradient_checkpointing: false
+    is_lora: false
+    lora_rank: 32
+
+  optim:
+    clip_grad: 1.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+  critic_optim:
+    clip_grad: 1.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: true
+    gradient_checkpointing: false
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

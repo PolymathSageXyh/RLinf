@@ -60,7 +60,7 @@ Tasks
    * - Real world
      - Franka Panda + RealSense — peg insertion
      - RGB + proprioception
-     - 6-dim end-effector pose
+     - 6-dim end-effector pose (legacy) or 7-dim pose + gripper (BC fine-tuning)
 
 How SAC-Flow Works
 ------------------
@@ -96,6 +96,72 @@ For running on real hardware, please refer to :doc:`franka` for installation and
 
 Run It
 ------
+
+Pretrained Flow-T: GELLO demonstrations to online SACFlow
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+RLinf also provides an opt-in, PyTorch-only path that reuses the same
+``FlowPolicy`` and ``FlowTActor`` for behavior cloning and online SACFlow:
+
+.. code-block:: text
+
+   realworld_collect_data_gello.yaml
+     ├─ collected_data/ → RollingLeRobotDataset → Flow BC
+     └─ demos/          → TrajectoryReplayBuffer → online SACFlow
+
+The two entry configurations are:
+
+- ``examples/sft/config/franka_gello_flow_bc.yaml`` for Rectified Flow or
+  experimental Improved MeanFlow supervision;
+- ``examples/embodiment/config/franka_sacflow_online_finetune.yaml`` for a
+  frozen-anchor warm-up followed by online SACFlow.
+
+The checked-in examples select Improved MeanFlow. To train and fine-tune
+Rectified Flow instead, change both
+``flow_matching.objective: rectified_flow`` and
+``flow_sampling.profile: rf_sacflow_sde_v1``, and set
+``flow_sampling.flow_sde.field_source: instantaneous_velocity``. Also remove
+the iMF-only ``noise_std_range`` and ``safe_initial_time`` keys from the
+``flow_sde`` block. Objective or checkpoint mismatches are rejected before
+weights are loaded.
+
+Both configurations use ``flow_actor_type: FlowTActor``, a 19-dimensional
+state, one action chunk, and a 7-dimensional GELLO action including the
+gripper. The portable BC artifact is
+``actor/flow_actor/model_state_dict/full_weights.pt`` plus
+``actor/flow_actor/flow_actor_manifest.json``. A full online resume through
+``runner.resume_dir`` takes precedence over actor-only initialization.
+
+Improved MeanFlow keeps its native direction (``t=1`` noise to ``t=0`` action)
+and conditions its interval field on two independently encoded times. Its ODE,
+flow-noise, and flow-SDE samplers evaluate only the adjacent interval field
+``U(z, t_from, t_to)``. The Flow-SDE transition follows the local OpenPI
+MeanFlow formula, but the Flow-T implementation neither imports nor modifies
+``openpi_action_model.py``. Online rollout is stochastic; evaluation is always
+the deterministic ODE.
+
+The online example initializes a fresh critic, hard-copies it to the target,
+starts alpha at 0.2, and samples the online and demonstration buffers 50/50.
+During the first 10,000 online transitions the critic trains normally while
+the actor receives only frozen-anchor action regularization and alpha remains
+fixed. Afterwards the actor loss is the SACFlow path-density objective plus
+the same anchor regularizer. The live actor and anchor use common initial and
+per-step noise when their actions are compared.
+
+This iMF integration and the Franka deployment are engineering extensions.
+The SACFlow paper's Appendix-F experiments were performed in simulation, so
+validate checkpoint identity, action limits, stochastic-path scale, and the
+warm-up phase in a dummy or hardware-in-the-loop setup before enabling robot
+motion.
+
+Launch the stages after replacing all data, checkpoint, robot, and target-pose
+placeholders:
+
+.. code-block:: bash
+
+   bash examples/embodiment/collect_data.sh realworld_collect_data_gello
+   bash examples/sft/run_vla_sft.sh franka_gello_flow_bc
+   bash examples/embodiment/run_embodiment.sh franka_sacflow_online_finetune
 
 **1. Configuration Files**
 

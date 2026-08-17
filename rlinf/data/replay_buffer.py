@@ -47,8 +47,10 @@ class TrajectoryCache:
     """FIFO cache for storing flattened trajectories."""
 
     def __init__(self, max_size: int = 5):
+        if isinstance(max_size, bool) or int(max_size) <= 0:
+            raise ValueError("TrajectoryCache max_size must be a positive integer.")
         self.cache: dict[int, int] = {}
-        self.max_size = max_size
+        self.max_size = int(max_size)
         self._buffer: Optional[dict] = None
         self._traj_num_samples: Optional[int] = None
         self._traj_key_lengths: dict[int, dict] = {}
@@ -255,16 +257,20 @@ class TrajectoryReplayBuffer:
         """
         self.trajectory_format = trajectory_format
         self.enable_cache = enable_cache
-        self.sample_window_size = sample_window_size
+        if isinstance(sample_window_size, bool) or int(sample_window_size) < 0:
+            raise ValueError("sample_window_size must be a non-negative integer.")
+        self.sample_window_size = int(sample_window_size)
         self.auto_save = auto_save
         self.logger = get_logger()
 
         if not self.auto_save:
             self.logger.warning(
-                f"auto_save is disabled, enabling cache with size {sample_window_size}"
+                f"auto_save is disabled, enabling cache with size {cache_size}"
             )
             self.enable_cache = True
-            cache_size = sample_window_size
+        if self.enable_cache and (isinstance(cache_size, bool) or int(cache_size) <= 0):
+            raise ValueError("cache_size must be positive when caching is enabled.")
+        cache_size = int(cache_size)
 
         # Auto-save path (only used when auto_save is enabled)
         if self.auto_save:
@@ -306,6 +312,8 @@ class TrajectoryReplayBuffer:
         # Separate executor for checkpoint saves
         self._checkpoint_executor = ThreadPoolExecutor(max_workers=20)
         self._index_lock = threading.Lock()
+        self._pending_save_lock = threading.Lock()
+        self._pending_save_futures = []
 
         # Cached window metadata for faster sampling
         self._window_cache_size = None
@@ -505,6 +513,11 @@ class TrajectoryReplayBuffer:
 
         # Save metadata/index after all trajectory saves finish
         if self.auto_save:
+            with self._pending_save_lock:
+                self._pending_save_futures = [
+                    future for future in self._pending_save_futures if not future.done()
+                ]
+                self._pending_save_futures.extend(save_futures)
 
             def _flush_metadata():
                 for fut in save_futures:
@@ -930,62 +943,81 @@ class TrajectoryReplayBuffer:
         # Create save directory
         os.makedirs(save_path, exist_ok=True)
 
-        save_futures = []
-        if not self.auto_save:
-            cache = self._flat_trajectory_cache
-            if cache is None:
-                raise RuntimeError("auto_save=False requires cache to save checkpoint.")
-            cached_ids = list(cache.cache.keys())
-            for trajectory_id in cached_ids:
-                flat = cache.get(trajectory_id)
-                if flat is None:
-                    continue
-                info = self._trajectory_index.get(trajectory_id, None)
-                if info is None:
-                    continue
-                shape = info.get("shape", None)
-                if not shape or len(shape) < 2:
-                    continue
-                T, B = shape[:2]
-                model_weights_id = info.get("model_weights_id", "")
-                trajectory = Trajectory(
-                    max_episode_length=info.get("max_episode_length", 0),
-                    model_weights_id=model_weights_id,
-                )
-                for field_name in trajectory.__dataclass_fields__.keys():
-                    if field_name in flat:
-                        setattr(
-                            trajectory,
-                            field_name,
-                            self._reshape_flat_for_save(flat[field_name], T, B),
-                        )
-                save_futures.append(
-                    self._checkpoint_executor.submit(
-                        self._save_trajectory,
-                        trajectory,
-                        trajectory_id,
-                        model_weights_id,
-                        save_dir=save_path,
-                    )
-                )
-        else:
-            for trajectory_id in self._window_cache_ids:
-                model_weights_id = self._trajectory_index[trajectory_id][
-                    "model_weights_id"
-                ]
-                trajectory_path = self._get_trajectory_path(
-                    trajectory_id, model_weights_id
-                )
-                if not os.path.isfile(trajectory_path):
-                    continue
+        # Auto-save writes are asynchronous. Wait for every trajectory file that
+        # was scheduled before taking the checkpoint snapshot.
+        with self._pending_save_lock:
+            pending_saves = list(self._pending_save_futures)
+        for future in pending_saves:
+            future.result()
 
-                # copy trajectory file from trajectory_path to save_path
-                target_path = os.path.join(save_path, os.path.basename(trajectory_path))
-                save_futures.append(
-                    self._checkpoint_executor.submit(
-                        shutil.copyfile, trajectory_path, target_path
-                    )
+        save_futures = []
+        missing_trajectory_ids = []
+        cache = self._flat_trajectory_cache
+        with self._index_lock:
+            trajectory_ids = list(self._trajectory_id_list)
+            trajectory_index = copy.deepcopy(self._trajectory_index)
+            trajectory_file_paths = dict(self._trajectory_file_path)
+
+        for trajectory_id in trajectory_ids:
+            info = trajectory_index[trajectory_id]
+            model_weights_id = info.get("model_weights_id", "")
+            source_dir = trajectory_file_paths.get(trajectory_id)
+            source_path = (
+                self._get_trajectory_path(
+                    trajectory_id,
+                    model_weights_id,
+                    base_dir=source_dir,
                 )
+                if source_dir is not None
+                else None
+            )
+            target_path = self._get_trajectory_path(
+                trajectory_id,
+                model_weights_id,
+                base_dir=save_path,
+            )
+
+            if source_path is not None and os.path.isfile(source_path):
+                if os.path.abspath(source_path) != os.path.abspath(target_path):
+                    save_futures.append(
+                        self._checkpoint_executor.submit(
+                            shutil.copyfile, source_path, target_path
+                        )
+                    )
+                continue
+
+            flat = cache.get(trajectory_id) if cache is not None else None
+            shape = info.get("shape", None)
+            if flat is None or not shape or len(shape) < 2:
+                missing_trajectory_ids.append(trajectory_id)
+                continue
+            T, B = shape[:2]
+            trajectory = Trajectory(
+                max_episode_length=info.get("max_episode_length", 0),
+                model_weights_id=model_weights_id,
+            )
+            for field_name in trajectory.__dataclass_fields__.keys():
+                if field_name in flat:
+                    setattr(
+                        trajectory,
+                        field_name,
+                        self._reshape_flat_for_save(flat[field_name], T, B),
+                    )
+            save_futures.append(
+                self._checkpoint_executor.submit(
+                    self._save_trajectory,
+                    trajectory,
+                    trajectory_id,
+                    model_weights_id,
+                    save_dir=save_path,
+                )
+            )
+
+        if missing_trajectory_ids:
+            raise RuntimeError(
+                "Cannot save a complete replay checkpoint because trajectory "
+                f"files/cache entries are missing for ids {missing_trajectory_ids}."
+            )
 
         for fut in save_futures:
             fut.result()

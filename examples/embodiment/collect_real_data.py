@@ -86,6 +86,25 @@ class DataCollector(Worker):
             auto_save_path=buffer_path,
             trajectory_format="pt",
         )
+        resume_collection = bool(dc_cfg and dc_cfg.get("resume", False))
+        if resume_collection:
+            replay_metadata = os.path.join(buffer_path, "metadata.json")
+            replay_index = os.path.join(buffer_path, "trajectory_index.json")
+            replay_files_exist = (
+                os.path.isfile(replay_metadata),
+                os.path.isfile(replay_index),
+            )
+            if any(replay_files_exist) and not all(replay_files_exist):
+                raise RuntimeError(
+                    "Cannot resume Franka demonstration replay: expected both "
+                    f"{replay_metadata} and {replay_index}."
+                )
+            if all(replay_files_exist):
+                self.buffer.load_checkpoint(buffer_path)
+                self.log_info(
+                    f"[resume] loaded {len(self.buffer)} replay trajectories "
+                    f"from {buffer_path}"
+                )
 
         # Outer rate limiter for envs that don't self-pace (e.g. direct-stream).
         fps = dc_cfg.get("fps") if dc_cfg else None

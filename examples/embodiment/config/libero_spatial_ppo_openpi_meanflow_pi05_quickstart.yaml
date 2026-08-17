@@ -33,7 +33,7 @@ runner:
   val_check_interval: -1
   save_interval: 100
 
-  resume_dir: null
+  resume_dir: "/nas/xyh/RLinf/logs/20260809-22:56:08-libero_spatial_ppo_openpi_meanflow_pi05_quickstart/libero_spatial_ppo_openpi_meanflow_pi05_quickstart_final_2_NFE/checkpoints/global_step_200"
   ckpt_path: null
 
 algorithm:

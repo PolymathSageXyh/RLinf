@@ -68,17 +68,7 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         if not recv_list:
             return
 
-        self.replay_buffer.add_trajectories(recv_list)
-
-        if self.demo_buffer is not None:
-            intervene_traj_list = []
-            for traj in recv_list:
-                intervene_trajs = traj.extract_intervene_traj()
-                if intervene_trajs is not None:
-                    intervene_traj_list.extend(intervene_trajs)
-
-            if len(intervene_traj_list) > 0:
-                self.demo_buffer.add_trajectories(intervene_traj_list)
+        self._add_received_trajectories(recv_list)
 
     async def _wait_for_replay_buffer_ready(self, min_buffer_size: int):
         while True:
@@ -100,6 +90,15 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
         await self._wait_for_replay_buffer_ready(min_buffer_size)
 
+        if self.sacflow_finetune_controller is not None:
+            finetune_phases = self._claim_sacflow_update_phases()
+            if not finetune_phases:
+                return {}
+            self._onload_sacflow_anchor()
+        else:
+            num_updates = self.cfg.algorithm.get("update_epoch", 1)
+            finetune_phases = (None,) * num_updates
+
         torch.distributed.barrier()
 
         assert (
@@ -116,10 +115,9 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.model.train()
         metrics = {}
 
-        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
+        for finetune_phase in finetune_phases:
             await asyncio.sleep(0)
-            metrics_data = self.update_one_epoch()
+            metrics_data = self.update_one_epoch(finetune_phase=finetune_phase)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
 
@@ -128,6 +126,10 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         torch.cuda.synchronize()
         torch.distributed.barrier()
         torch.cuda.empty_cache()
+        if self.sacflow_finetune_enabled and self.cfg.actor.get(
+            "enable_offload", False
+        ):
+            self._offload_sacflow_anchor()
         return mean_metric_dict
 
     async def stop(self):

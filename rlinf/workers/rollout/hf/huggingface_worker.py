@@ -479,6 +479,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.ABOT_M0,
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
+            SupportedModel.FLOW_POLICY,
             SupportedModel.CFG_MODEL,
         ]:
             loss_type = self.algorithm_cfg.get("loss_type", "actor")

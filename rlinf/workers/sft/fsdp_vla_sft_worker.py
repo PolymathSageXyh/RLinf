@@ -53,6 +53,21 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 config, framework="pytorch", shuffle=True
             )
             return data_loader, data_loader.data_config()
+        elif (
+            SupportedModel(self.cfg.actor.model.model_type)
+            == SupportedModel.FLOW_POLICY
+        ):
+            from rlinf.data.datasets.flow import (
+                build_franka_gello_flow_dataloader,
+            )
+
+            return build_franka_gello_flow_dataloader(
+                self.cfg,
+                self._world_size,
+                self._rank,
+                data_paths,
+                eval_dataset,
+            )
         elif SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.LINGBOTVLA
         ]:
@@ -104,7 +119,44 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         return loss, step_metrics
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        is_flow_policy = (
+            SupportedModel(self.cfg.actor.model.model_type)
+            == SupportedModel.FLOW_POLICY
+        )
+        if is_flow_policy and not self.cfg.actor.fsdp_config.get(
+            "save_full_model_weights", True
+        ):
+            raise ValueError(
+                "Flow BC requires actor.fsdp_config.save_full_model_weights=true "
+                "to export its portable actor checkpoint."
+            )
         super().save_checkpoint(save_path, step)
+
+        if is_flow_policy:
+            export_error = [None]
+            if self._rank == 0:
+                try:
+                    from rlinf.utils.flow_actor_checkpoint import (
+                        build_flow_actor_metadata_from_config,
+                        export_flow_actor_checkpoint,
+                    )
+
+                    metadata = build_flow_actor_metadata_from_config(
+                        self.cfg.actor.model
+                    )
+                    export_flow_actor_checkpoint(
+                        os.path.join(save_path, "model_state_dict", "full_weights.pt"),
+                        os.path.join(save_path, "flow_actor"),
+                        metadata=metadata,
+                        overwrite=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    export_error[0] = f"{type(exc).__name__}: {exc}"
+            torch.distributed.broadcast_object_list(export_error, src=0)
+            if export_error[0] is not None:
+                raise RuntimeError(
+                    f"Failed to export Flow BC actor-only checkpoint: {export_error[0]}"
+                )
 
         if isinstance(self.data_loader, StatefulDataLoader):
             state = self.data_loader.state_dict()

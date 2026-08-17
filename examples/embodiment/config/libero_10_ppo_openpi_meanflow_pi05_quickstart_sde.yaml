@@ -33,7 +33,7 @@ runner:
   val_check_interval: -1
   save_interval: 100
 
-  resume_dir: "/nas/xyh/RLinf/logs/20260730-20:21:12-libero_10_ppo_openpi_meanflow_pi05_quickstart_sde/libero_10_ppo_openpi_meanflow_pi05_quickstart_sde/checkpoints/global_step_500"
+  resume_dir: "/nas/xyh/RLinf/logs/20260809-22:39:28-libero_10_ppo_openpi_meanflow_pi05_quickstart_sde/libero_10_ppo_openpi_meanflow_pi05_quickstart_sde/checkpoints/global_step_600"
 
 algorithm:
   normalize_advantages: True

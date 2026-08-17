@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import queue
 import threading
 import time
+from numbers import Real
 from typing import Any, Iterator, Optional
 
 import torch
@@ -32,8 +34,8 @@ class ReplayBufferDataset(IterableDataset):
 
     This dataset provides an infinite iterator that yields batches sampled from
     a replay buffer and optionally a demonstration buffer. When both buffers are
-    provided, batches are composed of half replay samples and half demonstration
-    samples.
+    provided, ``demo_fraction`` controls the mixture and defaults to the legacy
+    half-replay/half-demonstration behavior.
 
     Attributes:
         replay_buffer: Buffer storing online rollout trajectories.
@@ -53,6 +55,7 @@ class ReplayBufferDataset(IterableDataset):
         batch_size: int,
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
+        demo_fraction: float = 0.5,
         **kwargs: Any,
     ) -> None:
         """Initializes the ReplayBufferDataset.
@@ -61,12 +64,13 @@ class ReplayBufferDataset(IterableDataset):
             replay_buffer: Buffer storing online rollout trajectories.
             demo_buffer: Optional buffer storing demonstration trajectories.
                 If None, only replay buffer is used.
-            batch_size: Total number of samples per batch. When demo_buffer is
-                provided, batch_size // 2 samples come from each buffer.
+            batch_size: Total number of samples per batch.
             min_replay_buffer_size: Minimum number of samples required in replay
                 buffer before sampling begins.
             min_demo_buffer_size: Minimum number of samples required in demo
                 buffer before sampling begins (ignored if demo_buffer is None).
+            demo_fraction: Fraction of a mixed batch sampled from the demo
+                buffer. Defaults to the legacy 0.5 split.
             **kwargs: Additional keyword arguments (unused, for compatibility).
         """
         self.replay_buffer = replay_buffer
@@ -75,6 +79,54 @@ class ReplayBufferDataset(IterableDataset):
         self.min_demo_buffer_size = min_demo_buffer_size
 
         self.batch_size = batch_size
+        if (
+            isinstance(demo_fraction, bool)
+            or not isinstance(demo_fraction, Real)
+            or not math.isfinite(demo_fraction)
+            or not 0.0 <= demo_fraction <= 1.0
+        ):
+            raise ValueError("demo_fraction must be finite and in [0, 1].")
+        self.demo_fraction = float(demo_fraction)
+
+    def _sample_counts(self) -> tuple[int, int]:
+        """Return replay/demo counts, preserving the legacy 0.5 split exactly."""
+        if self.demo_buffer is None:
+            return self.batch_size, 0
+        if self.demo_fraction == 0.5:
+            # Existing behavior intentionally yielded one fewer item for odd
+            # batch sizes. Keep that behavior for old configurations.
+            half_batch = self.batch_size // 2
+            return half_batch, half_batch
+        demo_count = int(self.batch_size * self.demo_fraction)
+        return self.batch_size - demo_count, demo_count
+
+    def _is_ready(self) -> bool:
+        """Return whether every buffer used by the configured mixture is ready."""
+        replay_count, demo_count = self._sample_counts()
+        if replay_count and not self.replay_buffer.is_ready(
+            self.min_replay_buffer_size
+        ):
+            return False
+        if demo_count and not self.demo_buffer.is_ready(self.min_demo_buffer_size):
+            return False
+        return True
+
+    def _sample_batch(self) -> dict[str, torch.Tensor]:
+        """Sample one batch using the configured replay/demo mixture."""
+        replay_count, demo_count = self._sample_counts()
+        replay_batch = self.replay_buffer.sample(replay_count) if replay_count else None
+        if demo_count:
+            assert self.demo_buffer is not None
+            demo_batch = self.demo_buffer.sample(demo_count)
+        else:
+            demo_batch = None
+        if replay_batch is None:
+            if demo_batch is None:
+                raise RuntimeError("Configured replay/demo mixture has zero samples.")
+            return demo_batch
+        if demo_batch is None:
+            return replay_batch
+        return concat_batch(replay_batch, demo_batch)
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         """Returns an infinite iterator that yields batches.
@@ -88,22 +140,8 @@ class ReplayBufferDataset(IterableDataset):
             depend on the buffer's trajectory format.
         """
         while True:
-            is_ready = True
-            if not self.replay_buffer.is_ready(self.min_replay_buffer_size):
-                is_ready = False
-            if self.demo_buffer is not None and not self.demo_buffer.is_ready(
-                self.min_demo_buffer_size
-            ):
-                is_ready = False
-
-            if is_ready:
-                if self.demo_buffer is not None:
-                    replay_batch = self.replay_buffer.sample(self.batch_size // 2)
-                    demo_batch = self.demo_buffer.sample(self.batch_size // 2)
-                    batch = concat_batch(replay_batch, demo_batch)
-                else:
-                    batch = self.replay_buffer.sample(self.batch_size)
-                yield batch
+            if self._is_ready():
+                yield self._sample_batch()
 
     def close(self) -> None:
         """Releases references to replay and demo buffers."""
@@ -143,6 +181,7 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
         prefetch_size: int = 5,
+        demo_fraction: float = 0.5,
     ) -> None:
         """Initializes the PreloadReplayBufferDataset.
 
@@ -158,21 +197,24 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
                 buffer before sampling begins (ignored if demo_buffer is None).
             prefetch_size: Maximum number of batches to prefetch and store in
                 the queue. Defaults to 10.
+            demo_fraction: Fraction of a mixed batch sampled from the demo
+                buffer. Defaults to the legacy 0.5 split.
         """
         self._stop_event = threading.Event()
-
-        self.replay_buffer = replay_buffer
-        self.demo_buffer = demo_buffer
-        self.min_replay_buffer_size = min_replay_buffer_size
-        self.min_demo_buffer_size = min_demo_buffer_size
-
-        self.batch_size = batch_size
+        self.sample_thread = None
+        self._exception = None
+        super().__init__(
+            replay_buffer=replay_buffer,
+            demo_buffer=demo_buffer,
+            batch_size=batch_size,
+            min_replay_buffer_size=min_replay_buffer_size,
+            min_demo_buffer_size=min_demo_buffer_size,
+            demo_fraction=demo_fraction,
+        )
         self.prefetch_size = prefetch_size
         assert self.prefetch_size > 0, f"{self.prefetch_size=} must be greater than 0"
 
         self.preload_queue = queue.Queue(maxsize=prefetch_size)
-        self.sample_thread = None
-        self._exception = None
 
     def _sample_buffer(self) -> None:
         """Background thread target that continuously samples batches.
@@ -187,21 +229,8 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
                 time.sleep(0.1)
                 continue
 
-            is_ready = True
-            if not self.replay_buffer.is_ready(self.min_replay_buffer_size):
-                is_ready = False
-            if self.demo_buffer is not None and not self.demo_buffer.is_ready(
-                self.min_demo_buffer_size
-            ):
-                is_ready = False
-
-            if is_ready:
-                if self.demo_buffer is not None:
-                    replay_batch = self.replay_buffer.sample(self.batch_size // 2)
-                    demo_batch = self.demo_buffer.sample(self.batch_size // 2)
-                    batch = concat_batch(replay_batch, demo_batch)
-                else:
-                    batch = self.replay_buffer.sample(self.batch_size)
+            if self._is_ready():
+                batch = self._sample_batch()
             else:
                 time.sleep(3)
                 continue
@@ -257,7 +286,7 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
         self._stop_event.set()
 
         thread_timeout = 10
-        if self.sample_thread.is_alive():
+        if self.sample_thread is not None and self.sample_thread.is_alive():
             self.sample_thread.join(timeout=thread_timeout)
             if self.sample_thread.is_alive():
                 logger.warning(

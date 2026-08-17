@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import copy
 import os
 from typing import Optional
 
@@ -35,6 +36,10 @@ from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
+from rlinf.utils.flow_actor_checkpoint import (
+    build_flow_actor_metadata_from_config,
+    load_flow_actor_checkpoint,
+)
 from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_split_num,
@@ -45,6 +50,12 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.actor.sacflow_finetune import (
+    SACFlowFinetuneController,
+    SACFlowFinetunePhase,
+    compute_frozen_anchor_actor_loss,
+    make_common_flow_noise,
+)
 
 
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
@@ -59,6 +70,34 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.alpha_optimizer = None
         self.update_step = 0
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
+
+        finetune_cfg = self.cfg.algorithm.get("sacflow_finetune", {})
+        self.sacflow_finetune_enabled = bool(finetune_cfg.get("enabled", False))
+        self.sacflow_finetune_cfg = finetune_cfg
+        self.sacflow_finetune_controller = None
+        self.sacflow_anchor_policy = None
+        if self.sacflow_finetune_enabled:
+            self.sacflow_finetune_controller = SACFlowFinetuneController(
+                warmup_transitions=finetune_cfg.get("warmup_transitions", 10_000),
+                updates_per_transition=finetune_cfg.get("updates_per_transition", 1.0),
+            )
+            self.sacflow_behavior_beta = float(
+                finetune_cfg.get("behavior_beta", 1_000.0)
+            )
+            self.sacflow_warmup_behavior_beta = float(
+                finetune_cfg.get("warmup_behavior_beta", self.sacflow_behavior_beta)
+            )
+            if (
+                not np.isfinite(self.sacflow_behavior_beta)
+                or not np.isfinite(self.sacflow_warmup_behavior_beta)
+                or self.sacflow_behavior_beta < 0
+                or self.sacflow_warmup_behavior_beta < 0
+            ):
+                raise ValueError(
+                    "SACFlow anchor regularization coefficients must be finite "
+                    "and non-negative."
+                )
+            self.sacflow_common_noise = bool(finetune_cfg.get("common_noise", True))
 
     def init_worker(self):
         self.setup_model_and_optimizer(initialize_target=True)
@@ -81,6 +120,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         module = self.model_provider_func()
         if initialize_target:
             target_module = self.model_provider_func()
+        if self.sacflow_finetune_enabled:
+            if not initialize_target:
+                raise ValueError(
+                    "Frozen-anchor SACFlow initialization requires a fresh target "
+                    "critic (initialize_target=True)."
+                )
+            if not self.cfg.actor.fsdp_config.get("use_orig_params", False):
+                raise ValueError(
+                    "Frozen-anchor SACFlow requires actor.fsdp_config."
+                    "use_orig_params=true so actor and Q-head parameters retain "
+                    "separate, verifiable optimizer ownership."
+                )
+            self._setup_sacflow_finetune_modules(module, target_module)
 
         # Enable gradient checkpointing if configured
         if self.cfg.actor.model.get("gradient_checkpointing", False):
@@ -111,7 +163,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
         use_dsrl = self.use_dsrl
-        if use_dsrl:
+        if self.sacflow_finetune_enabled:
+            # In fine-tuning, the online actor owns the complete observation-to-
+            # action path and the critic owns only Q heads. Critic forwards detach
+            # actor features below, avoiding optimizer overlap by construction.
+            param_filters = {"critic": ["q_head"]}
+        elif use_dsrl:
             # DSRL: separate actor/critic encoders into different optimizer groups
             param_filters = {
                 "critic": ["critic_image_encoder", "critic_state_encoder", "q_head"]
@@ -127,6 +184,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self.optimizer = optimizers[0]
         self.qf_optimizer = optimizers[1]
+        if self.sacflow_finetune_enabled:
+            self._validate_sacflow_optimizer_ownership()
 
         # SAC alpha
         # Initialize temperature parameter for automatic entropy tuning
@@ -156,6 +215,120 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.cfg.actor.fsdp_config.grad_scaler
         )
 
+        if self.sacflow_finetune_enabled and not self.cfg.actor.get(
+            "enable_offload", False
+        ):
+            self._onload_sacflow_anchor()
+
+    def _setup_sacflow_finetune_modules(self, module, target_module) -> None:
+        """Load BC weights and create a standalone frozen full-policy anchor."""
+        pretrained_cfg = self.cfg.actor.model.get("pretrained_actor", {})
+        checkpoint_path = pretrained_cfg.get("path", None)
+        is_full_resume = bool(self.cfg.runner.get("resume_dir", None))
+        if checkpoint_path and not is_full_resume:
+            expected_metadata = build_flow_actor_metadata_from_config(
+                self.cfg.actor.model
+            )
+            sampling_cfg = self.cfg.actor.model.get("flow_sampling", {})
+            configured_methods = {
+                section.get("method")
+                for name in ("actor_update", "online_rollout", "evaluation")
+                if (section := sampling_cfg.get(name, None)) is not None
+            }
+            expected_missing_prefixes = (
+                ("flow_actor.flow_noise_head",)
+                if "flow_noise" in configured_methods
+                else ()
+            )
+            report = load_flow_actor_checkpoint(
+                module,
+                checkpoint_path,
+                load_mode=str(pretrained_cfg.get("load_mode", "actor_only")),
+                strict_actor=bool(pretrained_cfg.get("strict_actor", True)),
+                expected_metadata=expected_metadata,
+                expected_missing_prefixes=expected_missing_prefixes,
+                require_manifest=bool(pretrained_cfg.get("require_manifest", True)),
+            )
+            # The target is hard-copied after setup, but initializing it here also
+            # avoids a transient mismatch before FSDP wrapping.
+            target_module.load_state_dict(module.state_dict())
+            self.logger.info(
+                "Loaded %d pretrained policy tensors from %s",
+                len(report.loaded_keys),
+                checkpoint_path,
+            )
+            if report.expected_missing_keys:
+                self.logger.warning(
+                    "The pretrained checkpoint intentionally omits %d online-only "
+                    "actor tensors.",
+                    len(report.expected_missing_keys),
+                )
+        elif not self.cfg.runner.get("ckpt_path", None) and not is_full_resume:
+            self.logger.warning(
+                "SACFlow fine-tuning is enabled without a pretrained actor file; "
+                "the current initialized policy will become the frozen anchor."
+            )
+
+        # Keep the anchor outside the FSDP tree: it must not be flattened,
+        # synchronized, exposed to either optimizer, or updated by target EMA.
+        self.sacflow_anchor_policy = copy.deepcopy(module)
+        self.sacflow_anchor_policy.requires_grad_(False)
+        self.sacflow_anchor_policy.eval()
+
+    def _validate_sacflow_optimizer_ownership(self) -> None:
+        """Fail fast unless online actor and Q parameters have one owner each."""
+        actor_ids = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        critic_ids = {
+            id(parameter)
+            for group in self.qf_optimizer.param_groups
+            for parameter in group["params"]
+        }
+        overlap = actor_ids & critic_ids
+        named_trainable = {
+            id(parameter): name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+        missing = set(named_trainable) - actor_ids - critic_ids
+        invalid_actor = sorted(
+            named_trainable.get(parameter_id, "<unknown>")
+            for parameter_id in actor_ids
+            if "q_head" in named_trainable.get(parameter_id, "")
+        )
+        invalid_critic = sorted(
+            named_trainable.get(parameter_id, "<unknown>")
+            for parameter_id in critic_ids
+            if "q_head" not in named_trainable.get(parameter_id, "")
+        )
+        if overlap or missing or invalid_actor or invalid_critic:
+            raise ValueError(
+                "Invalid frozen-anchor SACFlow optimizer ownership: "
+                f"overlap={len(overlap)}, missing="
+                f"{[named_trainable[key] for key in missing]}, "
+                f"actor_q_params={invalid_actor}, critic_non_q_params="
+                f"{invalid_critic}. Set FSDP use_orig_params=true and keep Q "
+                "heads in a dedicated q_head module."
+            )
+
+    def _onload_sacflow_anchor(self) -> None:
+        """Move the frozen anchor beside the online model when it is needed."""
+        if self.sacflow_anchor_policy is None:
+            return
+        model_device = next(self.model.parameters()).device
+        anchor_device = next(self.sacflow_anchor_policy.parameters()).device
+        if anchor_device != model_device:
+            self.sacflow_anchor_policy.to(model_device)
+        self.sacflow_anchor_policy.eval()
+
+    def _offload_sacflow_anchor(self) -> None:
+        """Mirror actor parameter offload for the standalone frozen anchor."""
+        if self.sacflow_anchor_policy is not None:
+            self.sacflow_anchor_policy.to("cpu")
+
     def build_lr_schedulers(self):
         self.lr_scheduler = self.build_lr_scheduler(
             self.optimizer, self.cfg.actor.optim
@@ -170,6 +343,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
     def setup_sac_components(self):
         """Initialize SAC-specific components"""
+        if (
+            self.sacflow_finetune_enabled
+            and self.cfg.algorithm.get("q_head_type", "default") == "crossq"
+        ):
+            raise NotImplementedError(
+                "Frozen-anchor SACFlow currently requires the default Q head so "
+                "critic forwards can detach the actor-owned observation encoder."
+            )
         # Initialize replay buffer
         seed = self.cfg.actor.get("seed", 1234)
         auto_save_path = self.cfg.algorithm.replay_buffer.get("auto_save_path", None)
@@ -222,6 +403,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             buffer_dataset_cls = PreloadReplayBufferDataset
         else:
             buffer_dataset_cls = ReplayBufferDataset
+        demo_fraction = self.cfg.algorithm.get("demo_fraction", 0.5)
+        if self.sacflow_finetune_enabled:
+            demo_fraction = self.sacflow_finetune_cfg.get(
+                "demo_fraction", demo_fraction
+            )
         self.buffer_dataset = buffer_dataset_cls(
             replay_buffer=self.replay_buffer,
             demo_buffer=self.demo_buffer,
@@ -229,6 +415,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             min_replay_buffer_size=self.cfg.algorithm.replay_buffer.min_buffer_size,
             min_demo_buffer_size=min_demo_buffer_size,
             prefetch_size=self.cfg.algorithm.replay_buffer.get("prefetch_size", 10),
+            demo_fraction=demo_fraction,
         )
         self.buffer_dataloader = DataLoader(
             self.buffer_dataset,
@@ -240,6 +427,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.buffer_dataloader_iter = iter(self.buffer_dataloader)
 
         self.critic_actor_ratio = self.cfg.algorithm.get("critic_actor_ratio", 1)
+        if self.sacflow_finetune_enabled and self.critic_actor_ratio != 1:
+            raise ValueError(
+                "Frozen-anchor SACFlow requires algorithm.critic_actor_ratio=1 "
+                "so every transition-budgeted critic update has its matching "
+                "warm-up or online actor update."
+            )
         self.critic_subsample_size = self.cfg.algorithm.get("critic_subsample_size", -1)
         self.critic_sample_generator = torch.Generator(self.device)
         self.critic_sample_generator.manual_seed(seed)
@@ -330,7 +523,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
+        self._add_received_trajectories(recv_list)
+
+    def _add_received_trajectories(self, recv_list: list[Trajectory]) -> int:
+        """Insert online data and advance the shared fine-tune transition clock."""
+        samples_before = self.replay_buffer.total_samples
         self.replay_buffer.add_trajectories(recv_list)
+        added_samples = self.replay_buffer.total_samples - samples_before
+        if self.sacflow_finetune_controller is not None:
+            self.sacflow_finetune_controller.record_online_transitions(added_samples)
 
         if self.demo_buffer is not None:
             intervene_traj_list = []
@@ -342,6 +543,30 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
             if len(intervene_traj_list) > 0:
                 self.demo_buffer.add_trajectories(intervene_traj_list)
+        return added_samples
+
+    def _claim_sacflow_update_phases(
+        self,
+    ) -> tuple[SACFlowFinetunePhase, ...]:
+        """Claim one rank-consistent UTD budget for sync or async training."""
+        if self.sacflow_finetune_controller is None:
+            return ()
+        available_updates = self.sacflow_finetune_controller.available_updates
+        if self._world_size > 1:
+            available_tensor = torch.tensor(
+                available_updates,
+                device=self.device,
+                dtype=torch.int64,
+            )
+            torch.distributed.all_reduce(
+                available_tensor, op=torch.distributed.ReduceOp.MIN
+            )
+            available_updates = int(available_tensor.item())
+        if available_updates == 0:
+            return ()
+        return self.sacflow_finetune_controller.claim_update_phases(
+            max_updates=available_updates
+        )
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
@@ -375,6 +600,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
             if use_dsrl:
                 kwargs["train"] = True
+            if self.sacflow_finetune_enabled:
+                # Critic bootstrap must not mutate actor BatchRenorm/statistics.
+                kwargs["train"] = False
+                kwargs.update(
+                    self._sacflow_actor_sampler_kwargs(log_prob_mode="temperature")
+                )
             next_state_actions, next_state_log_pi, shared_feature = self.model(
                 forward_type=ForwardType.SAC, obs=next_obs, **kwargs
             )
@@ -430,6 +661,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         if not use_crossq:
             dsrl_kwargs = {"train": True} if use_dsrl else {}
+            if self.sacflow_finetune_enabled:
+                dsrl_kwargs["detach_encoder"] = True
             all_data_q_values = self.model(
                 forward_type=ForwardType.SAC_Q,
                 obs=curr_obs,
@@ -472,8 +705,66 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         return critic_loss, {"q_data": all_data_q_values.mean().item()}
 
+    def _sacflow_sampling_kwargs(self, curr_obs) -> dict:
+        """Create common latent and per-step noises for policy/anchor pairing."""
+        if not self.sacflow_finetune_enabled or not self.sacflow_common_noise:
+            return {}
+        reference_tensor = next(
+            value for value in curr_obs.values() if isinstance(value, torch.Tensor)
+        )
+        anchor_dtype = next(self.sacflow_anchor_policy.parameters()).dtype
+        sampling_cfg = self.cfg.actor.model.get("flow_sampling", {})
+        actor_update_cfg = sampling_cfg.get("actor_update", {})
+        denoising_steps = actor_update_cfg.get(
+            "num_steps", self.cfg.actor.model.get("denoising_steps", 1)
+        )
+        return make_common_flow_noise(
+            batch_size=reference_tensor.shape[0],
+            action_dim=self.cfg.actor.model.action_dim,
+            denoising_steps=denoising_steps,
+            device=reference_tensor.device,
+            dtype=anchor_dtype,
+        )
+
+    def _sacflow_actor_sampler_kwargs(
+        self, *, log_prob_mode: str | None = "actor_surrogate"
+    ) -> dict:
+        """Select the configured differentiable actor-update sampler profile."""
+        if not self.sacflow_finetune_enabled:
+            return {}
+        actor_update_cfg = self.cfg.actor.model.flow_sampling.actor_update
+        kwargs = {
+            "sampler_method": actor_update_cfg.method,
+            "num_steps": actor_update_cfg.num_steps,
+        }
+        if log_prob_mode is not None:
+            kwargs["log_prob_mode"] = log_prob_mode
+        return kwargs
+
+    def _forward_frozen_sacflow_anchor(self, curr_obs, sampling_kwargs):
+        """Sample the immutable full-policy anchor with an explicitly shared path."""
+        if self.sacflow_anchor_policy is None:
+            raise RuntimeError("SACFlow frozen anchor has not been initialized.")
+        anchor_kwargs = dict(sampling_kwargs)
+        anchor_kwargs["train"] = False
+        # The anchor contributes actions only. Avoid the extra K fixed-trace
+        # field evaluations needed by the live actor's entropy-score surrogate.
+        anchor_kwargs["log_prob_mode"] = "temperature"
+        self.sacflow_anchor_policy.eval()
+        with torch.no_grad(), self.amp_context:
+            anchor_pi, _, _ = self.sacflow_anchor_policy(
+                forward_type=ForwardType.SAC,
+                obs=curr_obs,
+                **anchor_kwargs,
+            )
+        return anchor_pi
+
     @Worker.timer("forward_actor")
-    def forward_actor(self, batch):
+    def forward_actor(
+        self,
+        batch,
+        finetune_phase: SACFlowFinetunePhase | None = None,
+    ):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         if "actor_agg_q" in self.cfg.algorithm:
             agg_q = self.cfg.algorithm["actor_agg_q"]
@@ -486,12 +777,46 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             kwargs["temperature"] = self.cfg.rollout.sampling_params.temperature_train
         if self.use_dsrl:
             kwargs["train"] = True
+        if finetune_phase is not None:
+            kwargs["train"] = True
+        sampling_kwargs = self._sacflow_sampling_kwargs(curr_obs)
+        actor_log_prob_mode = (
+            "temperature"
+            if finetune_phase is SACFlowFinetunePhase.WARMUP
+            else "actor_surrogate"
+        )
+        sampling_kwargs.update(
+            self._sacflow_actor_sampler_kwargs(log_prob_mode=actor_log_prob_mode)
+        )
+        kwargs.update(sampling_kwargs)
         pi, log_pi, shared_feature = self.model(
             forward_type=ForwardType.SAC, obs=curr_obs, **kwargs
         )
         if log_pi.ndim == 1:
             log_pi = log_pi.unsqueeze(-1)
         log_pi = log_pi.sum(dim=-1, keepdim=True)  # sum over the chunk dimension
+        anchor_pi = None
+        if finetune_phase is not None:
+            anchor_pi = self._forward_frozen_sacflow_anchor(curr_obs, sampling_kwargs)
+
+        # Warm-up deliberately excludes Q and entropy from the actor objective.
+        if finetune_phase is SACFlowFinetunePhase.WARMUP:
+            actor_loss_parts = compute_frozen_anchor_actor_loss(
+                policy_actions=pi,
+                anchor_actions=anchor_pi,
+                behavior_beta=self.sacflow_warmup_behavior_beta,
+                phase=finetune_phase,
+            )
+            entropy = -log_pi.mean()
+            return (
+                actor_loss_parts.total,
+                entropy,
+                {
+                    "anchor_loss": actor_loss_parts.behavior.item(),
+                    "sac_loss": actor_loss_parts.sac.item(),
+                },
+            )
+
         if not use_crossq:
             dsrl_kwargs = {"train": True} if self.use_dsrl else {}
             all_qf_pi = self.model(
@@ -521,7 +846,21 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         elif agg_q == "mean":
             qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
         metrics["q_pi"] = qf_pi.mean().item()
-        actor_loss = ((self.entropy_temp.alpha * log_pi) - qf_pi).mean()
+        if finetune_phase is SACFlowFinetunePhase.ONLINE:
+            actor_loss_parts = compute_frozen_anchor_actor_loss(
+                policy_actions=pi,
+                anchor_actions=anchor_pi,
+                behavior_beta=self.sacflow_behavior_beta,
+                phase=finetune_phase,
+                joint_log_prob=log_pi,
+                q_value=qf_pi,
+                alpha=self.entropy_temp.alpha,
+            )
+            actor_loss = actor_loss_parts.total
+            metrics["anchor_loss"] = actor_loss_parts.behavior.item()
+            metrics["sac_loss"] = actor_loss_parts.sac.item()
+        else:
+            actor_loss = ((self.entropy_temp.alpha * log_pi) - qf_pi).mean()
 
         entropy = -log_pi.mean()
         return actor_loss, entropy, metrics
@@ -537,6 +876,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
             if self.use_dsrl:
                 kwargs["train"] = True
+            if self.sacflow_finetune_enabled:
+                kwargs["train"] = False
+                kwargs.update(
+                    self._sacflow_actor_sampler_kwargs(log_prob_mode="temperature")
+                )
             _, log_pi, _ = self.model(
                 forward_type=ForwardType.SAC, obs=curr_obs, **kwargs
             )
@@ -549,7 +893,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         return alpha_loss
 
     @Worker.timer("update_one_epoch")
-    def update_one_epoch(self, train_actor: bool = True):
+    def update_one_epoch(
+        self,
+        train_actor: bool = True,
+        finetune_phase: SACFlowFinetunePhase | None = None,
+    ):
         global_batch_size_per_rank = (
             self.cfg.actor.global_batch_size // self._world_size
         )
@@ -570,6 +918,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 drq.apply_drq(batch["next_obs"], pad=4)
             train_micro_batch_list[i] = batch
 
+        if finetune_phase is not None:
+            self.optimizer.zero_grad(set_to_none=True)
         self.qf_optimizer.zero_grad()
         gbs_critic_loss = []
         all_critic_metrics = {}
@@ -598,11 +948,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
             self.optimizer.zero_grad()
+            if finetune_phase is not None:
+                # Q is differentiable with respect to sampled actions, but Q-head
+                # gradients from the actor loss do not belong to either actor
+                # clipping or its optimizer step.
+                self.qf_optimizer.zero_grad(set_to_none=True)
             gbs_actor_loss = []
             gbs_entropy = []
             all_actor_metrics = {}
             for batch in train_micro_batch_list:
-                actor_loss, entropy, q_metrics = self.forward_actor(batch)
+                actor_loss, entropy, q_metrics = self.forward_actor(
+                    batch, finetune_phase=finetune_phase
+                )
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
@@ -612,6 +969,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"actor/{key}": np.mean(value)
                 for key, value in all_actor_metrics.items()
             }
+            if finetune_phase is not None:
+                self.qf_optimizer.zero_grad(set_to_none=True)
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
             )
@@ -621,7 +980,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             # Update temperature parameter if using automatic entropy tuning
             gbs_alpha_loss = [0]
             alpha_grad_norm = 0
-            if self.alpha_optimizer is not None:
+            train_alpha = finetune_phase is not SACFlowFinetunePhase.WARMUP
+            if self.alpha_optimizer is not None and train_alpha:
                 self.alpha_optimizer.zero_grad()
                 gbs_alpha_loss = []
                 for batch in train_micro_batch_list:
@@ -653,6 +1013,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     **all_actor_metrics,
                 }
             )
+            if finetune_phase is not None:
+                metrics_data["finetune/phase"] = float(
+                    finetune_phase is SACFlowFinetunePhase.ONLINE
+                )
         # Soft update target network
         if (
             self.target_model_initialized
@@ -675,6 +1039,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"demo_buffer/{key}": value for key, value in demo_buffer_stats.items()
             }
             append_to_dict(metrics, demo_buffer_stats)
+        if self.sacflow_finetune_controller is not None:
+            append_to_dict(
+                metrics,
+                {
+                    "finetune/online_transitions": self.sacflow_finetune_controller.online_transitions,
+                    "finetune/update_credit": self.sacflow_finetune_controller.update_credit,
+                    "finetune/completed_updates": self.sacflow_finetune_controller.completed_updates,
+                },
+            )
         # Average metrics across updates
         mean_metric_dict = {}
         for key, value in metrics.items():
@@ -714,10 +1087,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
             return {}
 
-        # Delay actor training until buffer has enough samples
-        train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
-        train_actor_steps = max(min_buffer_size, train_actor_steps)
-        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+        if self.sacflow_finetune_controller is not None:
+            finetune_phases = self._claim_sacflow_update_phases()
+            if not finetune_phases:
+                return {}
+            train_actor = True
+            self._onload_sacflow_anchor()
+        else:
+            num_updates = self.cfg.algorithm.get("update_epoch", 1)
+            finetune_phases = (None,) * num_updates
+            # Delay actor training until buffer has enough samples.
+            train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
+            train_actor_steps = max(min_buffer_size, train_actor_steps)
+            train_actor = self.replay_buffer.is_ready(train_actor_steps)
 
         assert (
             self.cfg.actor.global_batch_size
@@ -733,9 +1115,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.model.train()
         metrics = {}
 
-        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
-            metrics_data = self.update_one_epoch(train_actor=train_actor)
+        for finetune_phase in finetune_phases:
+            metrics_data = self.update_one_epoch(
+                train_actor=train_actor,
+                finetune_phase=finetune_phase,
+            )
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
 
@@ -744,6 +1128,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         torch.cuda.synchronize()
         torch.distributed.barrier()
         torch.cuda.empty_cache()
+        if self.sacflow_finetune_enabled and self.cfg.actor.get(
+            "enable_offload", False
+        ):
+            self._offload_sacflow_anchor()
         return mean_metric_dict
 
     @Worker.timer("actor/compute_adv")
@@ -804,6 +1192,30 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self.replay_buffer.save_checkpoint(buffer_save_path)
 
+        if self.sacflow_finetune_controller is not None:
+            anchor_save_path = os.path.join(save_base_path, "sac_components/anchor")
+            os.makedirs(anchor_save_path, exist_ok=True)
+            anchor_state_dict = {
+                key: value.detach().cpu()
+                for key, value in self.sacflow_anchor_policy.state_dict().items()
+            }
+            torch.save(
+                anchor_state_dict,
+                os.path.join(anchor_save_path, f"checkpoint_rank_{self._rank}.pt"),
+            )
+
+            finetune_save_path = os.path.join(
+                save_base_path, "sac_components/sacflow_finetune"
+            )
+            os.makedirs(finetune_save_path, exist_ok=True)
+            torch.save(
+                {
+                    "update_step": self.update_step,
+                    "controller": self.sacflow_finetune_controller.state_dict(),
+                },
+                os.path.join(finetune_save_path, f"state_rank_{self._rank}.pt"),
+            )
+
     def load_checkpoint(self, load_base_path):
         # load model
         self._strategy.load_checkpoint(
@@ -845,3 +1257,48 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.load_checkpoint(buffer_load_path)
+
+        if self.sacflow_finetune_controller is not None:
+            anchor_state_file = os.path.join(
+                load_base_path,
+                "sac_components/anchor",
+                f"checkpoint_rank_{self._rank}.pt",
+            )
+            finetune_state_file = os.path.join(
+                load_base_path,
+                "sac_components/sacflow_finetune",
+                f"state_rank_{self._rank}.pt",
+            )
+            if not os.path.isfile(anchor_state_file) or not os.path.isfile(
+                finetune_state_file
+            ):
+                raise FileNotFoundError(
+                    "A frozen-anchor SACFlow resume requires both the anchor and "
+                    "phase state saved by the fine-tuning worker. Missing one of: "
+                    f"{anchor_state_file}, {finetune_state_file}."
+                )
+
+            anchor_state_dict = torch.load(
+                anchor_state_file, map_location="cpu", weights_only=True
+            )
+            self.sacflow_anchor_policy.load_state_dict(anchor_state_dict, strict=True)
+            self.sacflow_anchor_policy.requires_grad_(False)
+            self.sacflow_anchor_policy.eval()
+
+            finetune_state = torch.load(
+                finetune_state_file, map_location="cpu", weights_only=True
+            )
+            self.update_step = int(finetune_state["update_step"])
+            self.sacflow_finetune_controller.load_state_dict(
+                finetune_state["controller"]
+            )
+            if self.sacflow_finetune_controller.completed_updates != self.update_step:
+                raise ValueError(
+                    "SACFlow checkpoint is inconsistent: worker update_step="
+                    f"{self.update_step}, controller completed_updates="
+                    f"{self.sacflow_finetune_controller.completed_updates}."
+                )
+            if self.cfg.actor.get("enable_offload", False):
+                self._offload_sacflow_anchor()
+            else:
+                self._onload_sacflow_anchor()
