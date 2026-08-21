@@ -48,6 +48,8 @@ class FrankaRobotConfig:
     camera_serials: Optional[list[str]] = None
     camera_names: Optional[dict[str, str]] = None
     camera_type: Optional[str] = None
+    camera_resolution: tuple[int, int] = (640, 480)
+    camera_fps: int = 15
     gripper_type: Optional[str] = None
     gripper_connection: Optional[str] = None
     enable_camera_player: bool = True
@@ -71,7 +73,7 @@ class FrankaRobotConfig:
     # Positions are stored in eular angles (xyz for position, rzryrx for orientation)
     # It will be converted to quaternions internally
     target_ee_pose: np.ndarray = field(
-        default_factory=lambda: np.array([0.5, 0.0, 0.1, -3.14, 0.0, 0.0])
+        default_factory=lambda: np.array([0.5, 0.0, 0.25, -3.14, 0.0, 0.0])
     )
     reset_ee_pose: np.ndarray = field(default_factory=lambda: np.zeros(6))
     joint_reset_qpos: list[float] = field(
@@ -119,6 +121,17 @@ class FrankaRobotConfig:
 
     def __post_init__(self):
         """Convert list fields from YAML/Hydra to numpy arrays."""
+        if len(self.camera_resolution) != 2 or any(
+            int(value) <= 0 for value in self.camera_resolution
+        ):
+            raise ValueError(
+                "camera_resolution must contain two positive values [width, height], "
+                f"got {self.camera_resolution!r}."
+            )
+        self.camera_resolution = tuple(int(value) for value in self.camera_resolution)
+        self.camera_fps = int(self.camera_fps)
+        if self.camera_fps <= 0:
+            raise ValueError(f"camera_fps must be positive, got {self.camera_fps}.")
         if self.camera_names is not None:
             self.camera_names = {
                 str(serial): str(camera_name)
@@ -205,8 +218,10 @@ class FrankaEnv(gym.Env):
         while not self._controller.is_robot_up().wait()[0]:
             time.sleep(0.5)
             if time.time() - start_time > 30:
-                self._logger.warning(
-                    f"Waited {time.time() - start_time} seconds for Franka robot to be ready."
+                raise RuntimeError(
+                    "Franka did not become ready within 30 seconds. Check the preceding "
+                    "roslaunch/libfranka output, robot Ethernet packet loss, brakes, and "
+                    "Franka Desk error state."
                 )
 
         self._interpolate_move(self._reset_pose)
@@ -682,6 +697,8 @@ class FrankaEnv(gym.Env):
                     name=name,
                     serial_number=serial,
                     camera_type=default_camera_type,
+                    resolution=self.config.camera_resolution,
+                    fps=self.config.camera_fps,
                     crop_region=crop_region,
                 )
             )

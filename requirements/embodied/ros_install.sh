@@ -27,6 +27,8 @@ sudo apt-get install -y --no-install-recommends \
     curl \
     lsb-release \
     gnupg \
+    ethtool \
+    iputils-ping \
     cmake \
     build-essential
 
@@ -109,4 +111,3 @@ sudo apt-get install -y --no-install-recommends \
     ros-noetic-xacro \
     ros-noetic-robot-state-publisher \
     ros-noetic-joint-state-publisher
-

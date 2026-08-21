@@ -93,7 +93,10 @@ class RelativeFrame(gym.Wrapper):
         """
         adjoint_inv = np.linalg.inv(self.adjoint_matrix)
         if "tcp_vel" in obs["state"]:
-            obs["state"]["tcp_vel"] = adjoint_inv @ obs["state"]["tcp_vel"]
+            tcp_vel = obs["state"]["tcp_vel"]
+            obs["state"]["tcp_vel"] = (adjoint_inv @ tcp_vel).astype(
+                tcp_vel.dtype, copy=False
+            )
 
         if self.include_relative_pose:
             T_b_o = construct_homogeneous_matrix(obs["state"]["tcp_pose"])
@@ -102,7 +105,10 @@ class RelativeFrame(gym.Wrapper):
             # Reconstruct transformed tcp_pose vector
             p_r_o = T_r_o[:3, 3]
             quat_r_o = R.from_matrix(T_r_o[:3, :3].copy()).as_quat()
-            obs["state"]["tcp_pose"] = np.concatenate((p_r_o, quat_r_o))
+            tcp_pose = obs["state"]["tcp_pose"]
+            obs["state"]["tcp_pose"] = np.concatenate((p_r_o, quat_r_o)).astype(
+                tcp_pose.dtype, copy=False
+            )
 
         return obs
 

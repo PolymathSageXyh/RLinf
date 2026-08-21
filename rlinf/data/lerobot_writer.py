@@ -17,6 +17,8 @@
 import gc
 from typing import Any
 
+import numpy as np
+
 from rlinf.utils.logging import get_logger
 
 
@@ -193,10 +195,39 @@ class LeRobotDatasetWriter:
         for frame_data in episode_data:
             self.dataset.add_frame(frame_data)
 
+        self._normalize_singleton_feature_buffers()
         self.dataset.save_episode()
         self.logger.info(
             f"Saved episode with {len(episode_data)} frames, task: '{episode_data[0].get('task', 'N/A')}'"
         )
+
+    def _normalize_singleton_feature_buffers(self) -> None:
+        """Match LeRobot singleton frame features to its HF scalar columns.
+
+        LeRobot validates ``shape=(1,)`` frame values as one-dimensional NumPy
+        arrays, but maps the corresponding Hugging Face feature to a scalar
+        ``datasets.Value``. Its save path stacks the arrays into ``(T, 1)``,
+        which newer NumPy versions no longer allow integer scalar encoders to
+        coerce. Collapse each buffered value to a zero-dimensional array so
+        LeRobot's subsequent stack produces the expected ``(T,)`` column.
+        """
+        features = getattr(self.dataset, "features", None)
+        episode_buffer = getattr(self.dataset, "episode_buffer", None)
+        if not isinstance(features, dict) or not isinstance(episode_buffer, dict):
+            return
+
+        for key, feature in features.items():
+            if feature.get("shape") != (1,):
+                continue
+            values = episode_buffer.get(key)
+            if not isinstance(values, list):
+                continue
+            episode_buffer[key] = [
+                value.reshape(())
+                if isinstance(value, np.ndarray) and value.shape == (1,)
+                else value
+                for value in values
+            ]
 
     def finalize(self) -> None:
         """Finalize the dataset and properly clean up all resources."""

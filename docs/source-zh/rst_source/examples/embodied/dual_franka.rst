@@ -119,6 +119,7 @@ RLinf 安装脚本只安装运行依赖；PREEMPT_RT 内核与实时权限请按
        echo performance > "$g"
    done'
    sudo sysctl -w kernel.sched_rt_runtime_us=-1
+   sudo ethtool --set-eee <FRANKA_NIC> eee off
    sudo ethtool -C <FRANKA_NIC> rx-usecs 0 tx-usecs 0 2>/dev/null || true
 
    # 可选：让 RT 调度预算设置跨重启持久化。

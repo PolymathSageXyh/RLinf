@@ -88,9 +88,13 @@ class BaseCamera(ABC):
     def _capture_frames(self):
         while self._frame_capturing_start:
             time.sleep(1 / self._camera_info.fps)
+            if not self._frame_capturing_start:
+                break
             try:
                 has_frame, frame = self._read_frame()
             except Exception as e:
+                if not self._frame_capturing_start:
+                    break
                 _logger.error(
                     "[%s] _read_frame raised %s: %s — exiting capture thread.",
                     self._camera_info.name,

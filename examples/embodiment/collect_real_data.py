@@ -166,7 +166,11 @@ class DataCollector(Worker):
                 current_rollout = EmbodiedRolloutResult(
                     max_episode_length=self.cfg.env.eval.max_episode_steps,
                 )
-            if kb_phase in (None, "rec"):
+            # A start event makes its *resulting* observation the episode's
+            # baseline.  The action that led to that observation happened while
+            # recording was still gated, so the first transition starts on the
+            # following control step.
+            if kb_phase in (None, "rec") and kb_event not in ("start", "restart"):
                 current_rollout.append_step_result(step_result)
                 current_rollout.append_transitions(
                     curr_obs=current_obs_processed, next_obs=next_obs_processed

@@ -29,6 +29,7 @@ from .end_effectors import (
     create_end_effector,
     normalize_end_effector_type,
 )
+from .franka_network import ensure_franka_network_ready
 from .franka_robot_state import FrankaRobotState
 
 
@@ -86,6 +87,10 @@ class FrankaController(Worker):
                 "'ROBOT_IP' environment variable on the controller's node."
             )
         self._robot_ip = robot_ip
+        self._robot_network_interface = ensure_franka_network_ready(
+            self._robot_ip,
+            self._logger,
+        )
         self._ros_pkg = ros_pkg
         self._end_effector_type = normalize_end_effector_type(
             end_effector_type,
@@ -97,16 +102,21 @@ class FrankaController(Worker):
         import rospy
         from dynamic_reconfigure.client import Client as ReconfClient
         from franka_msgs.msg import ErrorRecoveryActionGoal, FrankaState
+        from rosgraph_msgs.msg import Log as RosLog
         from serl_franka_controllers.msg import ZeroJacobian
 
         self._geom_msg = geom_msg
         self._rospy = rospy
         self._ErrorRecoveryActionGoal = ErrorRecoveryActionGoal
         self._FrankaState = FrankaState
+        self._RosLog = RosLog
         self._ZeroJacobian = ZeroJacobian
         self._ReconfClient = ReconfClient
 
         self._state = FrankaRobotState()
+        self._last_arm_state_time: float | None = None
+        self._control_command_success_rate: float | None = None
+        self._latched_communication_error: str | None = None
         self._end_effector: EndEffector | None = None
         self._gripper = None
 
@@ -183,6 +193,7 @@ class FrankaController(Worker):
         self._arm_reset_channel = "/franka_control/error_recovery/goal"
         self._arm_jacobian_channel = "/cartesian_impedance_controller/franka_jacobian"
         self._arm_state_channel = "franka_state_controller/franka_states"
+        self._rosout_channel = "/rosout_agg"
 
         self._ros.create_ros_channel(
             self._arm_equilibrium_channel,
@@ -204,11 +215,37 @@ class FrankaController(Worker):
             self._FrankaState,
             self._on_arm_state_msg,
         )
+        self._ros.connect_ros_channel(
+            self._rosout_channel,
+            self._RosLog,
+            self._on_rosout_msg,
+        )
 
     def _on_arm_jacobian_msg(self, msg):
         self._state.arm_jacobian = np.array(list(msg.zero_jacobian)).reshape(
             (6, 7), order="F"
         )
+
+    def _on_rosout_msg(self, msg) -> None:
+        """Latch libfranka communication aborts before recovery clears them."""
+        if (
+            self._latched_communication_error is None
+            and msg.name.rstrip("/").rsplit("/", 1)[-1] == "franka_control"
+            and "communication_constraints_violation" in msg.msg
+        ):
+            rate_suffix = ""
+            if self._control_command_success_rate is not None:
+                rate_suffix = (
+                    ", latest published control_command_success_rate="
+                    f"{self._control_command_success_rate:.3f}"
+                )
+            self._latched_communication_error = (
+                "Franka control was aborted by "
+                f"communication_constraints_violation{rate_suffix}. Restart this "
+                "collection run after fixing real-time Ethernet/CPU jitter; automatic "
+                "error recovery cannot make the interrupted trajectory valid."
+            )
+            self._logger.error(self._latched_communication_error)
 
     def _on_arm_state_msg(self, msg):
         tmatrix = np.array(list(msg.O_T_EE)).reshape(4, 4).T
@@ -229,6 +266,26 @@ class FrankaController(Worker):
                 "Jacobian not set, end-effector velocity temporarily unavailable: %s",
                 exc,
             )
+        self._control_command_success_rate = float(msg.control_command_success_rate)
+        if (
+            self._latched_communication_error is None
+            and msg.current_errors.communication_constraints_violation
+        ):
+            self._latched_communication_error = (
+                "Franka control was aborted by "
+                "communication_constraints_violation "
+                f"(control_command_success_rate="
+                f"{self._control_command_success_rate:.3f}). Restart this collection "
+                "run after fixing real-time Ethernet/CPU jitter; automatic error "
+                "recovery cannot make the interrupted trajectory valid."
+            )
+            self._logger.error(self._latched_communication_error)
+        self._last_arm_state_time = time.monotonic()
+
+    def _raise_for_latched_communication_error(self) -> None:
+        """Stop a run whose Cartesian control trajectory was interrupted."""
+        if self._latched_communication_error is not None:
+            raise RuntimeError(self._latched_communication_error)
 
     def reconfigure_compliance_params(self, params: dict[str, float]):
         self._reconf_client.update_configuration(params)
@@ -236,7 +293,19 @@ class FrankaController(Worker):
 
     def is_robot_up(self) -> bool:
         """Check whether the arm and active end-effector are ready."""
-        arm_ok = self._ros.get_input_channel_status(self._arm_state_channel)
+        self._raise_for_latched_communication_error()
+        state_is_fresh = (
+            self._last_arm_state_time is not None
+            and time.monotonic() - self._last_arm_state_time < 1.0
+        )
+        impedance_is_running = (
+            self._impedance is not None and self._impedance.poll() is None
+        )
+        arm_ok = (
+            self._ros.get_input_channel_status(self._arm_state_channel)
+            and state_is_fresh
+            and impedance_is_running
+        )
         if self._end_effector_type.is_gripper:
             return arm_ok and self._gripper.is_ready()
         return arm_ok
@@ -272,7 +341,21 @@ class FrankaController(Worker):
         )
 
         self._wait_robot()
+        self._ensure_impedance_running()
         self.log_debug(f"Start Impedance controller: {self._impedance.status()}")
+
+    def _ensure_impedance_running(self) -> None:
+        """Fail instead of silently publishing commands to a dead controller."""
+        if self._impedance is None:
+            raise RuntimeError("Franka impedance controller has not been started.")
+        return_code = self._impedance.poll()
+        if return_code is not None:
+            raise RuntimeError(
+                "Franka impedance controller exited "
+                f"(return_code={return_code}). Inspect the preceding roslaunch/libfranka "
+                "output. If it reports communication_constraints_violation, fix the "
+                "real-time Ethernet packet loss before starting data collection."
+            )
 
     def stop_impedance(self):
         if self._impedance:
@@ -324,6 +407,16 @@ class FrankaController(Worker):
 
     def move_arm(self, position: np.ndarray):
         """Move the robot arm to the desired position."""
+        self._ensure_impedance_running()
+        self._raise_for_latched_communication_error()
+        if (
+            self._last_arm_state_time is None
+            or time.monotonic() - self._last_arm_state_time >= 1.0
+        ):
+            raise RuntimeError(
+                "Franka state stream is stale; refusing to publish a Cartesian target. "
+                "Check the impedance-controller log and robot Ethernet connection."
+            )
         assert len(position) == 7, (
             f"Invalid position, expected 7 dimensions but got {len(position)}"
         )

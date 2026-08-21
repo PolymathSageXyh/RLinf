@@ -204,7 +204,34 @@ Franka 真机强化学习
 推荐在实时内核（Real-time Kernel）上运行 Franka 控制程序，以获得更好的实时性。
 请参考 `Franka 官方文档 <https://frankarobotics.github.io/docs/doc/libfranka/docs/real_time_kernel.html>`_ 安装实时内核。
 
-3. 依赖安装
+3. 实时以太网配置
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+请将机器人 Control 直接连接到一块专用有线网卡。启动 RLinf 前，解析实际路由
+网卡、关闭节能以太网（EEE），并按官方建议测试时延（替换两个占位符）：
+
+.. code:: bash
+
+   ip route get <robot_ip>
+   sudo ethtool --show-eee <franka_nic>
+   sudo ethtool --set-eee <franka_nic> eee off
+   sudo ethtool -C <franka_nic> rx-usecs 0 tx-usecs 0 2>/dev/null || true
+   sudo ping -q -D -i 0.001 -c 10000 -s 1200 <robot_ip>
+
+最大 RTT 应持续低于 1 ms；超过 1 ms 的尖峰可能使 1 kHz FCI 控制循环触发
+``communication_constraints_violation``。控制器具备权限时，RLinf 会自动关闭
+EEE，但宿主机重启后该设置可能恢复。若直连仍有时延尖峰，建议用专用 PCIe
+网卡替换 USB 以太网适配器。
+
+不要让机器人以太网适配器和高带宽 USB 相机共用同一个 USB 主控制器或 Hub。
+可用 ``readlink -f /sys/class/net/<franka_nic>/device`` 查看机器人网卡的硬件
+路径；若路径中含 ``/usb``，普通 ping 没有丢包也不能证明双向 1 kHz FCI 通信
+具备确定性。应将机器人连接迁移到专用 PCIe 网卡；临时缓解方案是把相机移到
+由另一块 USB 主控制器管理的端口。还可在 ``override_cfg`` 中设置
+``camera_resolution: [424, 240]`` 和 ``camera_fps: 15`` 降低相机采集负载，
+但它不能替代专用机器人网卡。
+
+4. 依赖安装
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A. 克隆 RLinf 仓库
@@ -474,6 +501,8 @@ GELLO 是一种关节级遥操作设备，其运动学结构与 Franka 机械臂
        use_spacemouse: False
        use_gello: True
        gello_port: "/dev/serial/by-id/usb-FTDI_..."  # 替换为你的 GELLO 串口路径
+       keyboard_reward_wrapper: single_stage
+       keyboard_start_key: "s"
 
 **运行**
 
@@ -481,7 +510,9 @@ GELLO 是一种关节级遥操作设备，其运动学结构与 Franka 机械臂
 
    bash examples/embodiment/collect_data.sh realworld_collect_data_gello
 
-整体流程与空间鼠标采集相同：使用 GELLO 设备操控机器人完成任务，脚本会自动保存成功的 episode。
+机械臂复位后，采集器先处于等待状态。按 ``s`` 以当前观测作为 episode
+起点并开始记录；记录期间按 ``a`` 标记失败并结束，按 ``b`` 给出中性奖励并继续，
+按 ``c`` 标记成功并结束。结束后机械臂再次复位，并重新等待 ``s``。
 
 集群设置
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -559,6 +590,8 @@ RLinf 使用 ray 来管理分布式环境，这意味着：
 可用模式如下：
 
 - ``single_stage``：按 ``a`` 记失败奖励，按 ``b`` 记中性奖励，按 ``c`` 记成功奖励。
+  配置 ``keyboard_start_key: "s"`` 后，每次 reset 后会等待 ``s``，按下后才开始记录；
+  未配置时保留原有的立即记录行为。
 - ``multi_stage``：按 ``a`` / ``b`` / ``c`` 在不同奖励阶段之间切换，按 ``q`` 输出负奖励。
 
 新的键盘监听器会直接读取 Linux 输入设备，因此需要在控制节点上、执行 ``ray start`` 之前导出 ``RLINF_KEYBOARD_DEVICE``。

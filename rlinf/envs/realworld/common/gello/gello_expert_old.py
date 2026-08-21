@@ -33,7 +33,7 @@ class GelloExpert:
     """
 
     def __init__(self, port: str):
-        from gello_teleop.franka_fk_final import FrankaFK
+        from gello_teleop.franka_fk import FrankaFK
         from gello_teleop.gello_teleop_agent import GelloTeleopAgent
 
         self._logger = get_logger()
@@ -182,10 +182,10 @@ if __name__ == "__main__":
     with np.printoptions(precision=3, suppress=True):
         while True:
             target_pos, target_quat, gripper = gello.get_action()
-            # gello_joints, gello_gripper = gello.agent.get_action()
+            #gello_joints, gello_gripper = gello.agent.get_action()
             print(
                 f"pos={target_pos}  quat={target_quat}  gripper={gripper}",
-                # f"gello_joints={gello_joints}",
+                #f"gello_joints={gello_joints}",
                 end="\r",
             )
             time.sleep(0.1)

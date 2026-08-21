@@ -205,7 +205,39 @@ Please take a note of the firmware version for later use.
 The Franka controller is recommended to run on a real-time kernel for better performance.
 Follow the instructions in `Franka documentation <https://frankarobotics.github.io/docs/doc/libfranka/docs/real_time_kernel.html>`_ to install the real-time kernel.
 
-3. Installation
+3. Real-time Ethernet Configuration
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Connect the robot Control directly to a dedicated wired NIC. Before starting
+RLinf, resolve that NIC, disable Energy Efficient Ethernet (EEE), and run the
+official latency-style ping test (replace both placeholders):
+
+.. code:: bash
+
+   ip route get <robot_ip>
+   sudo ethtool --show-eee <franka_nic>
+   sudo ethtool --set-eee <franka_nic> eee off
+   sudo ethtool -C <franka_nic> rx-usecs 0 tx-usecs 0 2>/dev/null || true
+   sudo ping -q -D -i 0.001 -c 10000 -s 1200 <robot_ip>
+
+The maximum RTT should remain below 1 ms; values above 1 ms can abort the 1 kHz
+FCI loop with ``communication_constraints_violation``. RLinf automatically
+disables EEE when the controller process has permission, but EEE may return
+after a host reboot. If a direct link still has latency spikes, prefer a
+dedicated PCIe NIC over a USB Ethernet adapter.
+
+Do not place the robot's Ethernet adapter and high-bandwidth USB cameras behind
+the same USB host controller or hub. ``readlink -f
+/sys/class/net/<franka_nic>/device`` reveals the robot NIC's hardware path. If
+that path contains ``/usb``, ordinary ping results alone do not prove that the
+bidirectional 1 kHz FCI traffic is deterministic. Move the robot connection to
+a dedicated PCIe NIC; alternatively, move the cameras to ports rooted at a
+different USB host controller as a temporary mitigation. Camera capture load
+can also be reduced with ``camera_resolution: [424, 240]`` and
+``camera_fps: 15`` under ``override_cfg``; this does not replace a dedicated
+robot NIC.
+
+4. Installation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 a. Clone RLinf Repository
@@ -469,6 +501,8 @@ The key differences from the SpaceMouse config are:
        use_spacemouse: False
        use_gello: True
        gello_port: "/dev/serial/by-id/usb-FTDI_..."  # Replace with your GELLO serial port
+       keyboard_reward_wrapper: single_stage
+       keyboard_start_key: "s"
 
 **Running**
 
@@ -476,7 +510,11 @@ The key differences from the SpaceMouse config are:
 
    bash examples/embodiment/collect_data.sh realworld_collect_data_gello
 
-The workflow is the same as SpaceMouse collection: use the GELLO device to demonstrate the task, and the script will automatically save successful episodes.
+After the arm resets, the collector waits without recording. Press ``s`` to
+make the current observation the episode start and begin recording. While
+recording, press ``a`` to end as failure, ``b`` for a neutral reward and
+continue, or ``c`` to end as success. The arm then resets and waits for ``s``
+again.
 
 Cluster Setup
 ~~~~~~~~~~~~~~~~~
@@ -550,6 +588,8 @@ For example, in ``examples/embodiment/config/realworld_peginsertion_rlpd_cnn_asy
 The available modes are:
 
 - ``single_stage``: press ``a`` for failure reward, ``b`` for neutral reward, and ``c`` for success reward.
+  With ``keyboard_start_key: "s"``, every reset waits for ``s`` before
+  recording; omitting it preserves the original immediate-recording behavior.
 - ``multi_stage``: press ``a`` / ``b`` / ``c`` to switch among reward stages, and press ``q`` to emit a negative reward.
 
 The keyboard listener reads Linux input devices directly, so you should export ``RLINF_KEYBOARD_DEVICE`` before starting ray on the controller node.

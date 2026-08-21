@@ -9,10 +9,10 @@ wrap_obs_mode: simple
 seed: 0
 group_size: 1
 use_fixed_reset_state_ids: False
-max_steps_per_rollout_epoch: 100
-max_episode_steps: 100
+max_steps_per_rollout_epoch: 1000
+max_episode_steps: 1000
 use_spacemouse: True
-main_image_key: wrist_1
+main_image_key: front
 
 video_cfg:
   save_video: False

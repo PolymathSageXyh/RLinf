@@ -7,6 +7,7 @@ export SRC_FILE="${EMBODIED_PATH}/collect_real_data.py"
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 
 export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
 
 
 if [ -z "$1" ]; then

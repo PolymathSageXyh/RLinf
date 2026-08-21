@@ -122,6 +122,7 @@ before starting Ray. Replace ``<FRANKA_NIC>`` with the dedicated robot NIC and
        echo performance > "$g"
    done'
    sudo sysctl -w kernel.sched_rt_runtime_us=-1
+   sudo ethtool --set-eee <FRANKA_NIC> eee off
    sudo ethtool -C <FRANKA_NIC> rx-usecs 0 tx-usecs 0 2>/dev/null || true
 
    # Optional: keep the RT scheduling budget setting after reboot.

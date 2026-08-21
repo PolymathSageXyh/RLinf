@@ -77,14 +77,19 @@ def _validate_teleop_mode(**modes: bool) -> None:
         )
 
 
-def _apply_keyboard_wrapper(env: gym.Env, mode: Optional[str]) -> gym.Env:
+def _apply_keyboard_wrapper(
+    env: gym.Env,
+    mode: Optional[str],
+    *,
+    start_key: Optional[str] = None,
+) -> gym.Env:
     config = env.get_wrapper_attr("config")
     if config.is_dummy or not mode:
         return env
     if mode == "multi_stage":
         return KeyboardRewardDoneMultiStageWrapper(env)
     if mode == "single_stage":
-        return KeyboardRewardDoneWrapper(env)
+        return KeyboardRewardDoneWrapper(env, start_key=start_key)
     if mode == "start_end":
         return KeyboardStartEndWrapper(env)
     if mode == "eval_control":
@@ -96,9 +101,8 @@ def _apply_keyboard_wrapper(env: gym.Env, mode: Optional[str]) -> gym.Env:
 
 def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
     """Wrapper stack for single-arm realworld envs (franka single, xsquare)."""
-    end_effector_type = str(
-        getattr(getattr(env, "config", None), "end_effector_type", "franka_gripper")
-    )
+    config = env.get_wrapper_attr("config")
+    end_effector_type = str(getattr(config, "end_effector_type", "franka_gripper"))
     is_dex_hand = end_effector_type.endswith("hand")
 
     no_gripper = cfg.get("no_gripper", True)
@@ -116,7 +120,7 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
 
     gripper_enabled = not no_gripper
 
-    if not env.config.is_dummy and use_spacemouse:
+    if not config.is_dummy and use_spacemouse:
         if is_dex_hand:
             glove_cfg = cfg.get("glove_config", {})
             DexHandIntervention = _load_dexhand_intervention()
@@ -130,7 +134,7 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
         else:
             env = SpacemouseIntervention(env, gripper_enabled=gripper_enabled)
 
-    if not env.config.is_dummy and use_gello:
+    if not config.is_dummy and use_gello:
         if is_dex_hand:
             raise ValueError("use_gello=True is not supported for ruiyan_hand.")
         gello_port = cfg.get("gello_port", None)
@@ -139,15 +143,31 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
                 "use_gello=True requires 'gello_port' in the env config "
                 "(e.g. env.eval.gello_port)."
             )
-        env = GelloIntervention(env, port=gello_port, gripper_enabled=gripper_enabled)
+        env = GelloIntervention(
+            env,
+            port=gello_port,
+            gripper_enabled=gripper_enabled,
+            startup_timeout=float(cfg.get("gello_startup_timeout", 10.0)),
+            stale_timeout=float(cfg.get("gello_stale_timeout", 1.0)),
+            max_start_position_error=float(
+                cfg.get("gello_max_start_position_error", 0.15)
+            ),
+            max_start_orientation_error=float(
+                cfg.get("gello_max_start_orientation_error", 0.50)
+            ),
+        )
 
-    if not env.config.is_dummy and use_pico:
+    if not config.is_dummy and use_pico:
         if is_dex_hand:
             raise ValueError("use_pico=True is not supported for dexterous hands.")
         pico_cfg = dict(cfg.get("pico", {}))
         env = PicoIntervention(env, gripper_enabled=gripper_enabled, **pico_cfg)
 
-    env = _apply_keyboard_wrapper(env, cfg.get("keyboard_reward_wrapper", None))
+    env = _apply_keyboard_wrapper(
+        env,
+        cfg.get("keyboard_reward_wrapper", None),
+        start_key=cfg.get("keyboard_start_key", None),
+    )
 
     if cfg.get("use_relative_frame", True):
         env = RelativeFrame(env)
@@ -205,5 +225,9 @@ def apply_dual_franka_joint_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gy
             **pico_cfg,
         )
 
-    env = _apply_keyboard_wrapper(env, cfg.get("keyboard_reward_wrapper", None))
+    env = _apply_keyboard_wrapper(
+        env,
+        cfg.get("keyboard_reward_wrapper", None),
+        start_key=cfg.get("keyboard_start_key", None),
+    )
     return env

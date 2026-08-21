@@ -43,35 +43,120 @@ class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
 
     def reward_terminated(
         self,
-    ) -> tuple[float, bool]:
+    ) -> tuple[bool, float, bool]:
         last_intervened, terminated, keyboard_reward = self._check_keypress()
         return last_intervened, keyboard_reward, terminated
 
 
 class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
+    """Single-stage keyboard reward wrapper with optional recording gate.
+
+    Without ``start_key`` this preserves the original behavior: ``a`` ends a
+    failed episode, ``b`` emits a neutral reward, and ``c`` ends a successful
+    episode.  When ``start_key`` is configured, reset enters a non-recording
+    phase and the configured key starts a fresh recording at the current
+    observation.  The phase metadata is consumed by ``CollectEpisode`` and the
+    standalone real-world data collector.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        reward_mode: str = "always_replace",
+        start_key: str | None = None,
+    ):
+        super().__init__(env, reward_mode=reward_mode)
+        if start_key is not None:
+            start_key = str(start_key).lower()
+            if len(start_key) != 1:
+                raise ValueError(
+                    f"keyboard_start_key must be one character, got {start_key!r}."
+                )
+            if start_key in {"a", "b", "c"}:
+                raise ValueError(
+                    "keyboard_start_key must not conflict with the single-stage "
+                    f"reward keys a/b/c, got {start_key!r}."
+                )
+        self.start_key = start_key
+        self._recording = start_key is None
+        self._keyboard_event: str | None = None
+        self._record_reset = False
+
+    def reset(self, *, seed=None, options=None):
+        self._recording = self.start_key is None
+        self._keyboard_event = None
+        self._record_reset = False
+        if self.start_key is not None:
+            # Do not let a press from the previous episode start the next one.
+            self.listener.pop_pressed_keys()
+            print(
+                f"Keyboard collection is ready; press '{self.start_key}' "
+                "to start recording."
+            )
+        return self.env.reset(seed=seed, options=options)
+
     def _check_keypress(self) -> tuple[bool, bool, float]:
         last_intervened = False
         done = False
         reward = 0
-        key = self.listener.get_key()
-        if key is not None:
-            print(f"Key pressed: {key}")
-        if key not in ["a", "b", "c"]:
-            return last_intervened, done, reward
+        self._keyboard_event = None
+        self._record_reset = False
 
-        last_intervened = True
-        if key == "a":
-            reward = -1
-            done = True
+        if self.start_key is None:
+            pressed_keys = [self.listener.get_key()]
+        else:
+            # Edge events avoid missing a quick tap between 10 Hz collection steps.
+            pressed_keys = self.listener.pop_pressed_keys()
+
+        for key in pressed_keys:
+            if key is None:
+                continue
+            print(f"Key pressed: {key}")
+
+            if not self._recording:
+                if key == self.start_key:
+                    self._recording = True
+                    self._keyboard_event = "start"
+                    self._record_reset = True
+                    last_intervened = True
+                # Reward/end keys are deliberately ignored before recording starts.
+                break
+
+            if key not in ["a", "b", "c"]:
+                continue
+
             last_intervened = True
-        elif key == "b":
-            reward = 0
-            last_intervened = True
-        elif key == "c":
-            reward = 1
-            done = True
-            last_intervened = True
+            if key == "a":
+                reward = -1
+                done = True
+                self._keyboard_event = "end_failure"
+            elif key == "b":
+                reward = 0
+                self._keyboard_event = "neutral"
+            elif key == "c":
+                reward = 1
+                done = True
+                self._keyboard_event = "end_success"
+            break
+
         return last_intervened, done, reward
+
+    def step(
+        self, action: ActType
+    ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
+        observation, reward, _terminated, truncated, info = self.env.step(action)
+        last_intervened, keyboard_reward, terminated = self.reward_terminated()
+        if last_intervened or self.reward_mode == "always_replace":
+            reward = keyboard_reward
+
+        if self.start_key is not None:
+            info["pre_record"] = not self._recording
+            info["record_reset"] = self._record_reset
+            info["keyboard_phase"] = "rec" if self._recording else "pre"
+            info["keyboard_event"] = self._keyboard_event
+            info["segment_advance"] = False
+
+        return observation, reward, terminated, truncated, info
 
 
 class KeyboardRewardDoneMultiStageWrapper(BaseKeyboardRewardDoneWrapper):
