@@ -113,7 +113,7 @@ env:
     use_spacemouse: false
     no_gripper: false
     ignore_terminations: false
-    auto_reset: false
+    auto_reset: true
     max_steps_per_rollout_epoch: 1
     override_cfg:
       is_dummy: false
@@ -125,7 +125,7 @@ env:
     use_spacemouse: false
     no_gripper: false
     ignore_terminations: false
-    auto_reset: false
+    auto_reset: true
 
 rollout:
   group_name: "RolloutGroup"
@@ -151,7 +151,7 @@ actor:
     model_type: "flow_policy"
     input_type: "mixed"
     image_size: [3, 128, 128]
-    image_num: 1
+    image_num: 2
     state_dim: 19
     action_dim: 7
     action_horizon: 1
@@ -160,6 +160,7 @@ actor:
     model_path: "/path/to/RLinf-ResNet10-pretrained"
     encoder_config:
       ckpt_name: "resnet10_pretrained.pt"
+      dropout: 0.0
     pretrained_actor:
       # Portable artifact from an H=1 Flow BC run. H>1 chunk artifacts are
       # intentionally rejected because online SACFlow remains single-step.
@@ -176,7 +177,7 @@ actor:
     q_head_type: "default"
 
     flow_actor_type: "FlowTActor"
-    denoising_steps: 4
+    denoising_steps: 2
     d_model: 256
     n_head: 4
     n_layers: 2

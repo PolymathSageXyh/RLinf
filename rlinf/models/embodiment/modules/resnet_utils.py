@@ -121,7 +121,12 @@ class ResNetEncoder(nn.Module):
                 channel=channel,
                 num_features=self.num_spatial_blocks,
             )
-            self.dropout = nn.Dropout(0.1)
+            dropout = float(self.encoder_cfg.get("dropout", 0.1))
+            if not 0.0 <= dropout < 1.0:
+                raise ValueError(
+                    f"encoder_config.dropout must be in [0, 1), got {dropout}."
+                )
+            self.dropout = nn.Dropout(dropout)
 
         # final linear
         self.mlp = nn.Sequential(
