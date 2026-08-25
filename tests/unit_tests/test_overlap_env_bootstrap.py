@@ -14,6 +14,8 @@
 
 import sys
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -32,7 +34,74 @@ if "rlinf.envs.wrappers" not in sys.modules:
     sys.modules["rlinf.envs.wrappers"] = MagicMock()
 
 from rlinf.scheduler.hardware.accelerators.accelerator import AcceleratorType
+from rlinf.utils.model_config import resolve_model_action_horizon  # noqa: E402
 from rlinf.workers.env.env_worker import EnvWorker  # noqa: E402
+
+
+class TestModelActionHorizon(unittest.TestCase):
+    def test_flow_policy_uses_action_horizon(self):
+        configs = (
+            {"model_type": "flow_policy", "action_horizon": 8},
+            OmegaConf.create({"model_type": "flow_policy", "action_horizon": 8}),
+            SimpleNamespace(model_type="flow_policy", action_horizon=8),
+        )
+
+        for model_cfg in configs:
+            with self.subTest(config_type=type(model_cfg).__name__):
+                self.assertEqual(resolve_model_action_horizon(model_cfg), 8)
+
+    def test_flow_policy_rejects_legacy_chunk_field(self):
+        for legacy_value in (1, None):
+            model_cfg = {
+                "model_type": "flow_policy",
+                "action_horizon": 1,
+                "num_action_chunks": legacy_value,
+            }
+
+            with self.subTest(legacy_value=legacy_value):
+                with self.assertRaisesRegex(
+                    ValueError, "does not support num_action_chunks"
+                ):
+                    resolve_model_action_horizon(model_cfg)
+
+    def test_non_flow_policy_keeps_num_action_chunks(self):
+        model_cfg = {
+            "model_type": "openpi",
+            "num_action_chunks": 5,
+            "action_horizon": 99,
+        }
+
+        self.assertEqual(resolve_model_action_horizon(model_cfg), 5)
+
+    def test_model_action_horizon_must_be_a_positive_integer(self):
+        for model_type in ("flow_policy", "openpi"):
+            field_name = (
+                "action_horizon" if model_type == "flow_policy" else "num_action_chunks"
+            )
+            for value in (None, True, 0, -1, 1.5):
+                model_cfg = {"model_type": model_type, field_name: value}
+                with self.subTest(model_type=model_type, value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "must be a positive integer"
+                    ):
+                        resolve_model_action_horizon(model_cfg)
+
+    def test_flow_policy_yaml_uses_only_action_horizon(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        relative_paths = (
+            "examples/embodiment/config/model/flow_policy.yaml",
+            "examples/embodiment/config/dosw1_pick_sac_flow.yaml",
+            "examples/embodiment/config/dosw1_pick_sac_flow_async.yaml",
+            "examples/embodiment/config/maniskill_sac_flow_state.yaml",
+            "examples/embodiment/config/realworld_sac_flow_image.yaml",
+            "tests/e2e_tests/embodied/maniskill_sac_flow_state.yaml",
+        )
+
+        for relative_path in relative_paths:
+            with self.subTest(relative_path=relative_path):
+                text = (repo_root / relative_path).read_text(encoding="utf-8")
+                self.assertIn("action_horizon:", text)
+                self.assertNotIn("num_action_chunks:", text)
 
 
 class TestOverlapEnvBootstrap(unittest.TestCase):

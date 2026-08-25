@@ -22,20 +22,52 @@ adapts a decoded frame to the observation contract consumed by FlowPolicy.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DistributedSampler
 
 from rlinf.data.lerobot_paths import resolve_lerobot_dataset_root
+from rlinf.utils.flow_bc_contract import (
+    FlowBCConfigError,
+    FlowBCSpec,
+    resolve_flow_bc_spec,
+)
 
 logger = logging.getLogger(__name__)
 
 FRANKA_GELLO_ACTION_DIM = 7
 _IMAGE_CHANNEL_COUNTS = (1, 3, 4)
+
+
+@dataclass(frozen=True)
+class _EpisodeSource:
+    """Canonical source metadata for one physical LeRobot episode."""
+
+    shard_path: Path
+    metadata: dict[str, Any]
+    episode_id: str
+    physical_start: int
+    num_frames: int
+    actions: np.ndarray
+
+
+@dataclass(frozen=True)
+class _SourceInspection:
+    """Content-derived dataset metadata collected without decoding images."""
+
+    source_fps: float
+    source_fingerprint: str
+    episodes: tuple[_EpisodeSource, ...]
 
 
 def _rolling_dataset_cls():
@@ -103,6 +135,247 @@ def discover_lerobot_shards(data_paths: Any) -> list[Path]:
 
     # Preserve deterministic ordering while removing duplicated configured roots.
     return list(dict.fromkeys(path.resolve() for path in shards))
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    """Serialize JSON metadata deterministically for content fingerprints."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _digest_field(digest: Any, value: bytes) -> None:
+    """Append one length-delimited field to a hashlib digest."""
+    digest.update(len(value).to_bytes(8, byteorder="big", signed=False))
+    digest.update(value)
+
+
+def _digest_actions(digest: Any, actions: np.ndarray) -> None:
+    """Append a path-independent canonical representation of an action stream."""
+    canonical = np.ascontiguousarray(actions, dtype="<f8")
+    _digest_field(digest, _canonical_json_bytes(list(canonical.shape)))
+    _digest_field(digest, canonical.tobytes(order="C"))
+
+
+def _read_episode_actions(
+    parquet_path: Path,
+    *,
+    action_key: str,
+    action_dim: int,
+) -> np.ndarray:
+    """Read one action column directly, without decoding image payloads."""
+    import pyarrow.parquet as pq
+
+    try:
+        table = pq.read_table(parquet_path, columns=[action_key])
+    except Exception as error:  # noqa: BLE001
+        raise ValueError(
+            f"Failed to read action column {action_key!r} from {parquet_path}."
+        ) from error
+    if int(table.num_rows) == 0:
+        return np.empty((0, int(action_dim)), dtype=np.float64)
+    try:
+        actions = np.asarray(table[action_key].to_pylist(), dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"LeRobot action column {action_key!r} in {parquet_path} "
+            "must contain fixed-size numeric vectors."
+        ) from error
+    expected_shape = (int(table.num_rows), int(action_dim))
+    if actions.shape != expected_shape:
+        raise ValueError(
+            f"LeRobot action column {action_key!r} in {parquet_path} must have "
+            f"shape {expected_shape}, got {actions.shape}."
+        )
+    if not np.isfinite(actions).all():
+        raise ValueError(
+            f"LeRobot action column {action_key!r} in {parquet_path} contains "
+            "non-finite values."
+        )
+    return np.ascontiguousarray(actions, dtype=np.float64)
+
+
+def _inspect_lerobot_sources(
+    shards: Sequence[Path],
+    *,
+    action_key: str,
+    action_dim: int,
+    configured_fps: Real,
+) -> _SourceInspection:
+    """Validate source metadata and derive stable action/statistics inputs."""
+    from rlinf.data.datasets.dagger.lerobot_io import (
+        _episode_parquet_path,
+        _read_jsonl,
+    )
+
+    if isinstance(configured_fps, bool) or not isinstance(configured_fps, Real):
+        raise ValueError(
+            f"data.fps must be a finite positive number, got {configured_fps!r}."
+        )
+    configured_fps = float(configured_fps)
+    if not math.isfinite(configured_fps) or configured_fps <= 0:
+        raise ValueError(
+            f"data.fps must be a finite positive number, got {configured_fps!r}."
+        )
+
+    source_fps: float | None = None
+    physical_start = 0
+    episode_sources: list[_EpisodeSource] = []
+    shard_digests: list[bytes] = []
+    for shard_path in shards:
+        info_path = shard_path / "meta" / "info.json"
+        episodes_path = shard_path / "meta" / "episodes.jsonl"
+        try:
+            with info_path.open() as info_file:
+                info = json.load(info_file)
+            episodes = _read_jsonl(episodes_path)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"Failed to read LeRobot metadata under {shard_path}."
+            ) from error
+
+        if "fps" not in info:
+            raise ValueError(
+                f"LeRobot shard {shard_path} meta/info.json is missing fps."
+            )
+        shard_fps_raw = info["fps"]
+        if isinstance(shard_fps_raw, bool) or not isinstance(shard_fps_raw, Real):
+            raise ValueError(
+                f"LeRobot shard {shard_path} fps must be finite and positive, "
+                f"got {shard_fps_raw!r}."
+            )
+        shard_fps = float(shard_fps_raw)
+        if not math.isfinite(shard_fps) or shard_fps <= 0:
+            raise ValueError(
+                f"LeRobot shard {shard_path} fps must be finite and positive, "
+                f"got {shard_fps_raw!r}."
+            )
+        if source_fps is None:
+            source_fps = shard_fps
+        elif not math.isclose(shard_fps, source_fps, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                "Flow BC LeRobot shards must have one common fps; observed "
+                f"{source_fps} and {shard_fps}."
+            )
+        if not math.isclose(shard_fps, configured_fps, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                f"Configured data.fps={configured_fps} does not match source "
+                f"fps={shard_fps} in {shard_path}."
+            )
+
+        shard_digest = hashlib.sha256()
+        _digest_field(shard_digest, _canonical_json_bytes(info))
+        for episode in episodes:
+            parquet_path = _episode_parquet_path(shard_path, info, episode)
+            actions = _read_episode_actions(
+                parquet_path,
+                action_key=action_key,
+                action_dim=action_dim,
+            )
+            _digest_field(shard_digest, _canonical_json_bytes(episode))
+            _digest_actions(shard_digest, actions)
+            if actions.shape[0] == 0:
+                continue
+
+            episode_digest = hashlib.sha256()
+            _digest_field(episode_digest, _canonical_json_bytes(episode))
+            _digest_actions(episode_digest, actions)
+            episode_id = f"sha256:{episode_digest.hexdigest()}"
+
+            episode_sources.append(
+                _EpisodeSource(
+                    shard_path=shard_path,
+                    metadata=episode,
+                    episode_id=episode_id,
+                    physical_start=physical_start,
+                    num_frames=int(actions.shape[0]),
+                    actions=actions,
+                )
+            )
+            physical_start += int(actions.shape[0])
+        shard_digests.append(shard_digest.digest())
+
+    if source_fps is None or not episode_sources:
+        raise ValueError("Flow BC source contains no non-empty LeRobot episodes.")
+
+    source_digest = hashlib.sha256()
+    for shard_digest in sorted(shard_digests):
+        _digest_field(source_digest, shard_digest)
+    return _SourceInspection(
+        source_fps=source_fps,
+        source_fingerprint=f"sha256:{source_digest.hexdigest()}",
+        episodes=tuple(episode_sources),
+    )
+
+
+def _select_episodes(
+    inspection: _SourceInspection,
+    *,
+    episode_split: Any,
+    eval_dataset: bool,
+) -> tuple[tuple[_EpisodeSource, ...], str, str]:
+    """Select whole episodes for train/eval and fingerprint the selection."""
+    episodes = inspection.episodes
+    if episode_split is None:
+        selected = episodes
+        split_name = "all"
+        split_descriptor: dict[str, Any] = {"split": split_name}
+    else:
+        if not isinstance(episode_split, Mapping):
+            raise ValueError("data.episode_split must be a mapping.")
+        unknown = sorted(set(episode_split) - {"seed", "val_fraction"})
+        if unknown:
+            raise ValueError(f"Unknown data.episode_split keys: {unknown}.")
+        seed = episode_split.get("seed", 0)
+        if isinstance(seed, bool) or not isinstance(seed, Integral):
+            raise ValueError("data.episode_split.seed must be an integer.")
+        val_fraction_raw = episode_split.get("val_fraction", None)
+        if isinstance(val_fraction_raw, bool) or not isinstance(val_fraction_raw, Real):
+            raise ValueError(
+                "data.episode_split.val_fraction must be a finite number in (0, 1)."
+            )
+        val_fraction = float(val_fraction_raw)
+        if not math.isfinite(val_fraction) or not 0.0 < val_fraction < 1.0:
+            raise ValueError(
+                "data.episode_split.val_fraction must be a finite number in (0, 1)."
+            )
+        if len(episodes) < 2:
+            raise ValueError(
+                "data.episode_split requires at least two non-empty episodes."
+            )
+
+        def split_rank(episode: _EpisodeSource) -> tuple[bytes, str, int]:
+            digest = hashlib.sha256(
+                f"{int(seed)}:{episode.episode_id}".encode("utf-8")
+            ).digest()
+            return digest, episode.episode_id, episode.physical_start
+
+        ranked = sorted(episodes, key=split_rank)
+        num_val = int(math.floor(len(ranked) * val_fraction + 0.5))
+        num_val = max(1, min(len(ranked) - 1, num_val))
+        val_starts = {episode.physical_start for episode in ranked[:num_val]}
+        split_name = "val" if eval_dataset else "train"
+        selected = tuple(
+            episode
+            for episode in episodes
+            if (episode.physical_start in val_starts) == eval_dataset
+        )
+        split_descriptor = {
+            "split": split_name,
+            "seed": int(seed),
+            "val_fraction": val_fraction,
+        }
+
+    split_digest = hashlib.sha256()
+    _digest_field(split_digest, inspection.source_fingerprint.encode("ascii"))
+    _digest_field(split_digest, _canonical_json_bytes(split_descriptor))
+    for episode_id in sorted(episode.episode_id for episode in selected):
+        _digest_field(split_digest, episode_id.encode("ascii"))
+    return selected, split_name, f"sha256:{split_digest.hexdigest()}"
 
 
 def _normalize_image_shape(image_shape: Sequence[int] | None) -> tuple[int, ...] | None:
@@ -221,21 +494,29 @@ def adapt_franka_gello_sample(
     image_keys: Sequence[str] = ("image",),
     state_dim: int | None = None,
     action_dim: int = FRANKA_GELLO_ACTION_DIM,
+    action_horizon: int = 1,
     image_shape: Sequence[int] | None = None,
     image_value_range: str = "auto",
 ) -> dict[str, Any]:
     """Adapt one decoded collector frame to the FlowPolicy SFT schema.
 
     This adapter intentionally supports only the single-arm Franka + GELLO
-    contract: one 7-D action (six Cartesian deltas plus gripper), one state
-    vector, and one or more images. No action slicing or implicit camera resize
-    is performed.
+    contract: 7-D actions (six Cartesian deltas plus gripper), one anchor state
+    vector, and one or more anchor images. No action slicing or implicit camera
+    resize is performed.
     """
     if int(action_dim) != FRANKA_GELLO_ACTION_DIM:
         raise ValueError(
             "Franka + GELLO Flow BC supports exactly action_dim=7; "
             f"configured action_dim={action_dim}. Action slicing is unsupported."
         )
+    if (
+        isinstance(action_horizon, bool)
+        or not isinstance(action_horizon, Integral)
+        or action_horizon <= 0
+    ):
+        raise ValueError("action_horizon must be a positive integer.")
+    action_horizon = int(action_horizon)
     if not image_keys:
         raise ValueError("Flow BC requires at least one image key.")
     if any(not isinstance(key, str) or not key for key in image_keys):
@@ -243,7 +524,11 @@ def adapt_franka_gello_sample(
     if len(set(image_keys)) != len(image_keys):
         raise ValueError(f"Flow BC image_keys must be unique, got {list(image_keys)}.")
 
-    missing = [key for key in (state_key, action_key, *image_keys) if key not in sample]
+    required_keys = [state_key, action_key, *image_keys]
+    action_pad_key = f"{action_key}_is_pad"
+    if action_horizon > 1:
+        required_keys.append(action_pad_key)
+    missing = [key for key in required_keys if key not in sample]
     if missing:
         raise KeyError(f"Flow BC sample is missing required keys: {missing}.")
 
@@ -260,17 +545,47 @@ def adapt_franka_gello_sample(
         )
 
     actions = torch.as_tensor(sample[action_key], dtype=torch.float32)
-    if actions.ndim == 2 and actions.shape[0] == 1:
-        actions = actions[0]
-    if actions.ndim != 1 or actions.numel() != FRANKA_GELLO_ACTION_DIM:
-        raise ValueError(
-            f"Expected one GELLO action with shape [7], got {tuple(actions.shape)}; "
-            "action slicing is intentionally unsupported."
-        )
+    if action_horizon == 1:
+        if actions.ndim == 1 and actions.numel() == FRANKA_GELLO_ACTION_DIM:
+            actions = actions.unsqueeze(0)
+        if tuple(actions.shape) != (1, FRANKA_GELLO_ACTION_DIM):
+            raise ValueError(
+                "Expected one GELLO action with shape [7] or [1, 7], got "
+                f"{tuple(actions.shape)}; action slicing is intentionally unsupported."
+            )
+        action_valid_mask = torch.ones(1, dtype=torch.bool)
+    else:
+        expected_action_shape = (action_horizon, FRANKA_GELLO_ACTION_DIM)
+        if tuple(actions.shape) != expected_action_shape:
+            raise ValueError(
+                f"Expected GELLO action chunk with shape {expected_action_shape}, "
+                f"got {tuple(actions.shape)}."
+            )
+        action_is_pad = torch.as_tensor(sample[action_pad_key])
+        if action_is_pad.dtype != torch.bool:
+            raise ValueError(f"{action_pad_key} must be a boolean tensor.")
+        if tuple(action_is_pad.shape) != (action_horizon,):
+            raise ValueError(
+                f"{action_pad_key} must have shape ({action_horizon},), "
+                f"got {tuple(action_is_pad.shape)}."
+            )
+        action_valid_mask = ~action_is_pad
+        if not bool(action_valid_mask.any()):
+            raise ValueError(
+                "Flow BC action chunk must contain at least one valid action."
+            )
+        if bool(((~action_valid_mask[:-1]) & action_valid_mask[1:]).any()):
+            raise ValueError(
+                "Flow BC action_valid_mask must be prefix-valid with padding only "
+                "at the tail."
+            )
     if not torch.isfinite(states).all():
         raise ValueError("Franka state contains non-finite values.")
-    if not torch.isfinite(actions).all():
-        raise ValueError("GELLO action contains non-finite values.")
+    if not torch.isfinite(actions[action_valid_mask]).all():
+        raise ValueError("Valid GELLO actions contain non-finite values.")
+    actions = torch.where(
+        action_valid_mask[:, None], actions, torch.zeros_like(actions)
+    )
 
     images = [
         _image_to_unit_chw(
@@ -288,13 +603,15 @@ def adapt_franka_gello_sample(
     if len(images) > 1:
         obs["extra_view_images"] = torch.stack(images[1:], dim=0)
 
-    return {
+    output = {
         "obs": obs,
-        "actions": actions.contiguous(),
+        "action": actions.contiguous(),
         # The FlowPolicy SFT seam must honor this and skip preprocess_env_obs's
         # second /255 conversion.
         "images_preprocessed": torch.tensor(True),
     }
+    output["action_valid_mask"] = action_valid_mask.contiguous()
+    return output
 
 
 class FrankaGelloFlowDataset(Dataset):
@@ -314,6 +631,9 @@ class FrankaGelloFlowDataset(Dataset):
         fps: int = 10,
         min_frames: int = 1,
         load_workers: int = 0,
+        action_horizon: int = 1,
+        episode_split: Any = None,
+        eval_dataset: bool = False,
     ) -> None:
         super().__init__()
         if int(action_dim) != FRANKA_GELLO_ACTION_DIM:
@@ -322,15 +642,22 @@ class FrankaGelloFlowDataset(Dataset):
             )
         if int(state_dim) <= 0:
             raise ValueError(f"state_dim must be positive, got {state_dim}.")
-        if int(fps) <= 0:
-            raise ValueError(f"fps must be positive, got {fps}.")
+        if isinstance(fps, bool) or not isinstance(fps, Integral) or fps <= 0:
+            raise ValueError(f"fps must be a positive integer, got {fps!r}.")
         if int(min_frames) <= 0:
             raise ValueError(f"min_frames must be positive, got {min_frames}.")
         if int(load_workers) < 0:
             raise ValueError(f"load_workers must be non-negative, got {load_workers}.")
+        if (
+            isinstance(action_horizon, bool)
+            or not isinstance(action_horizon, Integral)
+            or action_horizon <= 0
+        ):
+            raise ValueError("action_horizon must be a positive integer.")
 
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
+        self.action_horizon = int(action_horizon)
         self.image_keys = tuple(image_keys)
         self.image_shape = _normalize_image_shape(image_shape)
         self.state_key = state_key
@@ -338,11 +665,41 @@ class FrankaGelloFlowDataset(Dataset):
         self.image_value_range = image_value_range
 
         shards = discover_lerobot_shards(data_paths)
+        inspection = _inspect_lerobot_sources(
+            shards,
+            action_key=action_key,
+            action_dim=self.action_dim,
+            configured_fps=fps,
+        )
+        selected_episodes, split_name, split_fingerprint = _select_episodes(
+            inspection,
+            episode_split=episode_split,
+            eval_dataset=bool(eval_dataset),
+        )
+        self.source_fps = inspection.source_fps
+        self.source_fingerprint = inspection.source_fingerprint
+        self.episode_split = (
+            None
+            if episode_split is None
+            else {
+                "seed": int(episode_split.get("seed", 0)),
+                "val_fraction": float(episode_split["val_fraction"]),
+            }
+        )
+        self.split_name = split_name
+        self.episode_ids = tuple(episode.episode_id for episode in selected_episodes)
+        self.episode_split_fingerprint = split_fingerprint
+        self.num_source_episodes = len(inspection.episodes)
+        self.num_selected_episodes = len(selected_episodes)
+
         rolling_dataset_cls = _rolling_dataset_cls()
+        retained_keys = [state_key, action_key, *self.image_keys]
+        if self.action_horizon > 1:
+            retained_keys.append(f"{action_key}_is_pad")
         self._base = rolling_dataset_cls(
             root_dir=Path(shards[0]).parent,
-            chunk_size=1,
-            keys=[state_key, action_key, *self.image_keys],
+            chunk_size=self.action_horizon,
+            keys=retained_keys,
             min_frames=int(min_frames),
             action_sequence_keys=[action_key],
             in_memory_mode=True,
@@ -352,16 +709,41 @@ class FrankaGelloFlowDataset(Dataset):
             shards, num_workers=int(load_workers)
         )
         episodes, frames = self._base.publish_staged_resume_shards(staged)
-        if frames < int(min_frames):
+        expected_frames = sum(episode.num_frames for episode in inspection.episodes)
+        if frames != expected_frames:
             raise ValueError(
-                f"Flow BC dataset has {frames} usable frames, fewer than "
+                "Flow BC decoded frame count does not match source metadata: "
+                f"decoded={frames}, inspected={expected_frames}."
+            )
+
+        if episode_split is None:
+            self._sample_indices: tuple[int, ...] | None = None
+            selected_frames = frames
+        else:
+            self._sample_indices = tuple(
+                frame_index
+                for episode in selected_episodes
+                for frame_index in range(
+                    episode.physical_start,
+                    episode.physical_start + episode.num_frames,
+                )
+            )
+            selected_frames = len(self._sample_indices)
+        if selected_frames < int(min_frames):
+            raise ValueError(
+                f"Flow BC {split_name} split has {selected_frames} usable frames, "
+                "fewer than "
                 f"data.min_frames={min_frames}."
             )
         logger.info(
-            "Loaded Franka GELLO Flow BC data: shards=%d episodes=%d frames=%d",
+            "Loaded Franka GELLO Flow BC data: shards=%d episodes=%d/%d "
+            "frames=%d/%d split=%s",
             len(shards),
+            self.num_selected_episodes,
             episodes,
+            selected_frames,
             frames,
+            split_name,
         )
 
         # Fail before distributed training starts if the stored schema differs
@@ -369,9 +751,13 @@ class FrankaGelloFlowDataset(Dataset):
         self[0]
 
     def __len__(self) -> int:
-        return len(self._base)
+        if self._sample_indices is None:
+            return len(self._base)
+        return len(self._sample_indices)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        if self._sample_indices is not None:
+            index = self._sample_indices[index]
         return adapt_franka_gello_sample(
             self._base[index],
             state_key=self.state_key,
@@ -379,12 +765,19 @@ class FrankaGelloFlowDataset(Dataset):
             image_keys=self.image_keys,
             state_dim=self.state_dim,
             action_dim=self.action_dim,
+            action_horizon=self.action_horizon,
             image_shape=self.image_shape,
             image_value_range=self.image_value_range,
         )
 
 
-def _validate_flow_bc_model_contract(model_cfg: Any, image_keys: Sequence[str]) -> None:
+def _validate_flow_bc_model_contract(
+    model_cfg: Any, image_keys: Sequence[str]
+) -> FlowBCSpec:
+    try:
+        spec = resolve_flow_bc_spec(model_cfg, task_type="sft")
+    except FlowBCConfigError as error:
+        raise ValueError(str(error)) from error
     actor_type = str(model_cfg.get("flow_actor_type", ""))
     if actor_type != "FlowTActor":
         raise ValueError(
@@ -400,9 +793,17 @@ def _validate_flow_bc_model_contract(model_cfg: Any, image_keys: Sequence[str]) 
             "Franka + GELLO Flow BC requires model.action_dim=7; "
             f"got {model_cfg.get('action_dim', None)!r}."
         )
-    if int(model_cfg.get("num_action_chunks", 1)) != 1:
+    if bool(model_cfg.get("use_batch_norm", False)):
+        raise ValueError("Flow BC requires model.use_batch_norm=false.")
+    d_model = model_cfg.get("d_model", None)
+    if (
+        isinstance(d_model, bool)
+        or not isinstance(d_model, Integral)
+        or d_model < spec.flow_state_dim
+    ):
         raise ValueError(
-            "Franka + GELLO Flow BC currently supports num_action_chunks=1 only."
+            "Flow BC requires model.d_model >= "
+            f"action_horizon * action_dim ({spec.flow_state_dim})."
         )
     image_num = int(model_cfg.get("image_num", 1))
     if image_num != len(image_keys):
@@ -414,6 +815,7 @@ def _validate_flow_bc_model_contract(model_cfg: Any, image_keys: Sequence[str]) 
     if image_size is None:
         raise ValueError("Franka + GELLO image Flow BC requires model.image_size.")
     _normalize_image_shape(image_size)
+    return spec
 
 
 def build_franka_gello_flow_dataloader(
@@ -438,7 +840,7 @@ def build_franka_gello_flow_dataloader(
             "data.image_value_range must be 'zero_one' or 'auto'."
         )
     image_keys = tuple(data_cfg.get("image_keys", ["image"]))
-    _validate_flow_bc_model_contract(model_cfg, image_keys)
+    spec = _validate_flow_bc_model_contract(model_cfg, image_keys)
 
     dataset = FrankaGelloFlowDataset(
         data_paths,
@@ -451,9 +853,12 @@ def build_franka_gello_flow_dataloader(
         # RollingLeRobotDataset decodes images as float CHW in [0,1]. Keeping
         # this explicit detects accidental uint8/double-normalized paths.
         image_value_range=image_value_range,
-        fps=int(data_cfg.get("fps", 10)),
+        fps=data_cfg.get("fps", 10),
         min_frames=int(data_cfg.get("min_frames", 1)),
         load_workers=int(data_cfg.get("load_workers", 0)),
+        action_horizon=spec.action_horizon,
+        episode_split=data_cfg.get("episode_split", None),
+        eval_dataset=eval_dataset,
     )
     use_random_replacement = (
         bool(data_cfg.get("use_random_replacement", False)) and not eval_dataset
@@ -532,6 +937,12 @@ def build_franka_gello_flow_dataloader(
         "num_samples": len(dataset),
         "state_dim": dataset.state_dim,
         "action_dim": dataset.action_dim,
+        "action_horizon": dataset.action_horizon,
+        "flow_state_dim": dataset.action_horizon * dataset.action_dim,
+        "action_shape": [dataset.action_horizon, dataset.action_dim],
+        "action_layout": "chunk_major",
+        "action_valid_mask": True,
+        "action_padding": "zero",
         "image_keys": list(dataset.image_keys),
         "image_shape": list(dataset.image_shape) if dataset.image_shape else None,
         "image_layout": "CHW",
@@ -539,4 +950,12 @@ def build_franka_gello_flow_dataloader(
         "images_preprocessed": True,
         "use_random_replacement": use_random_replacement,
         "num_samples_per_epoch": num_samples_per_epoch,
+        "source_fps": dataset.source_fps,
+        "source_fingerprint": dataset.source_fingerprint,
+        "episode_split": dataset.episode_split,
+        "split_name": dataset.split_name,
+        "episode_ids": list(dataset.episode_ids),
+        "episode_split_fingerprint": dataset.episode_split_fingerprint,
+        "num_source_episodes": dataset.num_source_episodes,
+        "num_selected_episodes": dataset.num_selected_episodes,
     }

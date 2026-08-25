@@ -37,7 +37,6 @@ from typing import Any
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.config import _validate_flow_policy_v2_cfg
 from rlinf.data.datasets.flow import build_franka_gello_flow_dataloader
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.flow_policy import get_model
@@ -45,6 +44,7 @@ from rlinf.utils.flow_actor_checkpoint import (
     build_flow_actor_metadata_from_config,
     export_flow_actor_checkpoint,
 )
+from rlinf.utils.flow_bc_contract import resolve_flow_bc_spec
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "examples/sft/config/franka_gello_flow_bc.yaml"
@@ -243,12 +243,7 @@ def main() -> None:
             "Config placement does not match the requested physical GPU: "
             f"actor={placement!r}."
         )
-    _validate_flow_policy_v2_cfg(
-        cfg.actor.model,
-        task_type="sft",
-        data_cfg=cfg.data,
-        resume_dir=cfg.runner.resume_dir,
-    )
+    flow_spec = resolve_flow_bc_spec(cfg.actor.model, task_type="sft")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = args.output_root.resolve() / timestamp
@@ -269,7 +264,9 @@ def main() -> None:
     probe_batch = _move_to_device(next(data_iter), device)
     fixed_training_batch = probe_batch if args.batch_mode == "fixed" else None
 
-    model = get_model(cfg.actor.model, torch_dtype=torch.float32).to(device)
+    model = get_model(cfg.actor.model, torch_dtype=torch.float32)
+    runtime_metadata = build_flow_actor_metadata_from_config(cfg.actor.model)
+    model = model.to(device)
     optimizer, fused_optimizer = _build_optimizer(model, cfg.actor.optim)
     trainable_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
@@ -381,7 +378,7 @@ def main() -> None:
     artifact = export_flow_actor_checkpoint(
         model,
         run_dir / "portable_actor_smoke",
-        metadata=build_flow_actor_metadata_from_config(cfg.actor.model),
+        metadata=runtime_metadata,
     )
     summary = {
         "passed": passed,
@@ -390,6 +387,8 @@ def main() -> None:
         "config_path": str(args.config.resolve()),
         "data_path": str(cfg.data.train_data_paths),
         "data_config": data_config,
+        "action_horizon": flow_spec.action_horizon,
+        "latent_normalization": flow_spec.latent_normalization,
         "steps": args.steps,
         "batch_size": args.batch_size,
         "batch_mode": args.batch_mode,

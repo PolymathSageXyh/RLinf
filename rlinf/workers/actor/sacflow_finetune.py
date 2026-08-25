@@ -244,25 +244,28 @@ def compute_frozen_anchor_actor_loss(
 def make_common_flow_noise(
     *,
     batch_size: int,
+    action_horizon: int,
     action_dim: int,
     denoising_steps: int,
     device: torch.device | str | int,
     dtype: torch.dtype,
-) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
+) -> dict[str, torch.Tensor]:
     """Create one immutable-by-convention noise path for policy and anchor."""
     for name, value in (
         ("batch_size", batch_size),
+        ("action_horizon", action_horizon),
         ("action_dim", action_dim),
         ("denoising_steps", denoising_steps),
     ):
         if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
             raise ValueError(f"{name} must be a positive integer.")
 
-    shape = (int(batch_size), int(action_dim))
+    shape = (int(batch_size), int(action_horizon), int(action_dim))
     initial_noise = torch.randn(shape, device=device, dtype=dtype)
-    step_noises = tuple(
-        torch.randn(shape, device=device, dtype=dtype)
-        for _ in range(int(denoising_steps))
+    step_noises = torch.randn(
+        (int(batch_size), int(denoising_steps), *shape[1:]),
+        device=device,
+        dtype=dtype,
     )
     return {"initial_noise": initial_noise, "step_noises": step_noises}
 

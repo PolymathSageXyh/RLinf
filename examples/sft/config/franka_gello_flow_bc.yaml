@@ -18,17 +18,17 @@ runner:
   logger:
     log_path: "/nas/xyh/RLinf/results/flow_bc"
     project_name: rlinf
-    experiment_name: "franka_gello_flow_bc_30000"
+    experiment_name: "franka_gello_imf_bc_h8_pick_cube_newest"
     logger_backends: ["wandb"]
   max_epochs: -1
-  max_steps: 30000
+  max_steps: 100000
   val_check_interval: -1
-  save_interval: 1000
+  save_interval: 10000
   resume_dir: null
 
 data:
   # GELLO collection root produced by realworld_collect_data_gello.yaml.
-  train_data_paths: "/nas/xyh/data/data_pick_cube/collected_data"
+  train_data_paths: "/nas/xyh/data/pick_cube_newest/collected_data"
   val_data_paths: null
   format: "lerobot"
   state_key: "state"
@@ -37,6 +37,10 @@ data:
   image_value_range: "zero_one"
   fps: 10
   min_frames: 1
+  # Reserve whole episodes for static validation.
+  episode_split:
+    seed: 1234
+    val_fraction: 0.2
   num_workers: 0
   pin_memory: true
   use_random_replacement: true
@@ -57,7 +61,8 @@ actor:
     image_num: 2
     state_dim: 19
     action_dim: 7
-    num_action_chunks: 1
+    # Predict 0.8 seconds jointly at the 10 Hz source rate.
+    action_horizon: 8
     action_scale: [-1.0, 1.0]
 
     model_path: "/nas/xyh/RLinf/.cache/flow_bc/RLinf-ResNet10-pretrained"
@@ -69,7 +74,7 @@ actor:
     add_value_head: false
     add_q_head: false
     flow_actor_type: "FlowTActor"
-    denoising_steps: 4
+    denoising_steps: 10
     d_model: 256
     n_head: 4
     n_layers: 2
@@ -77,9 +82,12 @@ actor:
     batch_norm_momentum: 0.99
 
     flow_matching:
-      implementation: "pytorch_flow_t_v2"
+      implementation: "pytorch_flow_t"
       objective: "improved_meanflow"
       action_transform: "tanh_latent"
+      action_chunking:
+        action_layout: "chunk_major"
+        latent_normalization: "identity"
       improved_meanflow:
         boundary_pair_probability: 0.5
         logit_mean: -0.4
@@ -90,6 +98,11 @@ actor:
           from_encoder: "independent_mlp"
           to_encoder: "independent_mlp"
           fusion: "concat_linear_2d_to_d"
+
+    flow_sampling:
+      evaluation:
+        method: "flow_ode"
+        num_steps: 10
 
     gradient_checkpointing: false
     is_lora: false

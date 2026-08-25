@@ -36,8 +36,10 @@ from typing import Any
 import torch
 from torch import nn
 
+from rlinf.utils.flow_bc_contract import resolve_flow_bc_spec
+
 FLOW_ACTOR_CHECKPOINT_FORMAT = "rlinf.flow_actor"
-FLOW_ACTOR_CHECKPOINT_VERSION = 1
+FLOW_ACTOR_CHECKPOINT_SCHEMA = "unified_flow_t_bc"
 FLOW_ACTOR_MANIFEST_FILENAME = "flow_actor_manifest.json"
 FULL_WEIGHTS_FILENAME = "full_weights.pt"
 FLOW_ACTOR_FRAMEWORK = "pytorch"
@@ -62,6 +64,7 @@ DEFAULT_EXCLUDED_PREFIXES = ("q_head", "value_head")
 _SEMANTIC_MANIFEST_FIELDS = (
     "framework",
     "actor_class",
+    "implementation",
     "objective",
     "field_kind",
     "integration_direction",
@@ -72,10 +75,34 @@ _SEMANTIC_MANIFEST_FIELDS = (
     "action_dim",
     "action_range",
     "action_transform",
+    "action_horizon",
+    "flow_state_dim",
+    "action_layout",
+    "latent_normalization",
+    "padding",
+    "mask_role",
+    "loss_reduction",
     "load_mode",
     "strict_actor",
     "require_manifest",
 )
+_METADATA_FIELDS = {
+    *_SEMANTIC_MANIFEST_FIELDS,
+    "flow_actor_type",
+    "time_encoding",
+    "state_dim",
+    "image_size",
+    "image_num",
+    "image_layout",
+    "image_value_range",
+}
+
+CHUNK_MAJOR_ACTION_LAYOUT = "chunk_major"
+FLOW_T_IMPLEMENTATION = "pytorch_flow_t"
+IDENTITY_LATENT_NORMALIZATION = "identity"
+ZERO_PADDING = "zero"
+LOSS_ONLY_MASK = "loss_only"
+VALID_COORDINATE_MEAN = "valid_coordinate_mean"
 
 _OBJECTIVE_ENDPOINTS = {
     RECTIFIED_FLOW_OBJECTIVE: {
@@ -157,6 +184,14 @@ def _require_positive_int(value: Any, name: str) -> int:
     return value
 
 
+def _validate_identity_latent_normalization(value: Any) -> str:
+    if value != IDENTITY_LATENT_NORMALIZATION:
+        raise FlowActorCheckpointError(
+            "FlowTActor artifacts require latent_normalization='identity'."
+        )
+    return IDENTITY_LATENT_NORMALIZATION
+
+
 def build_flow_actor_metadata(
     *,
     objective: str,
@@ -167,7 +202,13 @@ def build_flow_actor_metadata(
     time_fusion: str | None = None,
     action_range: Sequence[float] = (-1.0, 1.0),
     action_transform: str = "tanh_latent",
-    extra_metadata: Mapping[str, Any] | None = None,
+    action_horizon: int,
+    flow_state_dim: int | None = None,
+    action_layout: str = CHUNK_MAJOR_ACTION_LAYOUT,
+    latent_normalization: str = IDENTITY_LATENT_NORMALIZATION,
+    padding: str = ZERO_PADDING,
+    mask_role: str = LOSS_ONLY_MASK,
+    loss_reduction: str = VALID_COORDINATE_MEAN,
 ) -> dict[str, Any]:
     """Build canonical FlowTActor artifact metadata.
 
@@ -191,6 +232,34 @@ def build_flow_actor_metadata(
         raise FlowActorCheckpointError(
             "FlowTActor artifacts currently require action_transform='tanh_latent', "
             f"got {action_transform!r}."
+        )
+    action_horizon = _require_positive_int(action_horizon, "action_horizon")
+    expected_flow_state_dim = action_dim * action_horizon
+    if flow_state_dim is None:
+        flow_state_dim = expected_flow_state_dim
+    flow_state_dim = _require_positive_int(flow_state_dim, "flow_state_dim")
+    if flow_state_dim != expected_flow_state_dim:
+        raise FlowActorCheckpointError(
+            "flow_state_dim must equal action_dim * action_horizon: "
+            f"got {flow_state_dim}, expected {expected_flow_state_dim}."
+        )
+    if action_layout != CHUNK_MAJOR_ACTION_LAYOUT:
+        raise FlowActorCheckpointError(
+            f"action_layout must be {CHUNK_MAJOR_ACTION_LAYOUT!r}, "
+            f"got {action_layout!r}."
+        )
+    normalized_latent = _validate_identity_latent_normalization(latent_normalization)
+    if padding != ZERO_PADDING:
+        raise FlowActorCheckpointError(
+            f"FlowTActor artifacts require padding={ZERO_PADDING!r}."
+        )
+    if mask_role != LOSS_ONLY_MASK:
+        raise FlowActorCheckpointError(
+            f"FlowTActor artifacts require mask_role={LOSS_ONLY_MASK!r}."
+        )
+    if loss_reduction != VALID_COORDINATE_MEAN:
+        raise FlowActorCheckpointError(
+            f"FlowTActor artifacts require loss_reduction={VALID_COORDINATE_MEAN!r}."
         )
     if len(action_range) != 2:
         raise FlowActorCheckpointError(
@@ -251,7 +320,7 @@ def build_flow_actor_metadata(
     metadata: dict[str, Any] = {
         "framework": FLOW_ACTOR_FRAMEWORK,
         "actor_class": FLOW_ACTOR_TYPE,
-        # Kept as an explicit compatibility alias for the existing FlowConfig.
+        "implementation": FLOW_T_IMPLEMENTATION,
         "flow_actor_type": FLOW_ACTOR_TYPE,
         "objective": objective,
         "field_kind": contract["field_kind"],
@@ -264,6 +333,13 @@ def build_flow_actor_metadata(
         "action_dim": action_dim,
         "action_range": [action_min, action_max],
         "action_transform": action_transform,
+        "action_horizon": action_horizon,
+        "flow_state_dim": flow_state_dim,
+        "action_layout": action_layout,
+        "latent_normalization": normalized_latent,
+        "padding": padding,
+        "mask_role": mask_role,
+        "loss_reduction": loss_reduction,
         "state_dim": state_dim,
         "image_size": normalized_image_size,
         "image_num": image_num,
@@ -273,13 +349,6 @@ def build_flow_actor_metadata(
         "strict_actor": True,
         "require_manifest": True,
     }
-    if extra_metadata is not None:
-        collisions = sorted(set(extra_metadata) & set(metadata))
-        if collisions:
-            raise FlowActorCheckpointError(
-                f"extra_metadata cannot override reserved fields: {collisions}."
-            )
-        metadata.update(dict(extra_metadata))
     return validate_flow_actor_metadata(metadata)
 
 
@@ -295,6 +364,13 @@ def validate_flow_actor_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
         raise FlowActorCheckpointError(
             f"Flow actor metadata must be JSON serializable: {exc}"
         ) from exc
+    missing = sorted(_METADATA_FIELDS - set(normalized))
+    extra = sorted(set(normalized) - _METADATA_FIELDS)
+    if missing or extra:
+        raise FlowActorCheckpointError(
+            "Flow actor metadata does not match the unified schema: "
+            f"missing={missing}, extra={extra}."
+        )
 
     if normalized.get("framework") != FLOW_ACTOR_FRAMEWORK:
         raise FlowActorCheckpointError(
@@ -305,6 +381,10 @@ def validate_flow_actor_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
         raise FlowActorCheckpointError(
             "Only FlowTActor artifacts are supported; metadata.actor_class "
             f"must be {FLOW_ACTOR_TYPE!r}."
+        )
+    if normalized.get("implementation") != FLOW_T_IMPLEMENTATION:
+        raise FlowActorCheckpointError(
+            f"FlowTActor metadata requires implementation={FLOW_T_IMPLEMENTATION!r}."
         )
     if normalized.get("flow_actor_type") != FLOW_ACTOR_TYPE:
         raise FlowActorCheckpointError(
@@ -367,6 +447,38 @@ def validate_flow_actor_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
         raise FlowActorCheckpointError(
             "FlowTActor metadata requires action_transform='tanh_latent'."
         )
+    action_horizon = _require_positive_int(
+        normalized.get("action_horizon"), "action_horizon"
+    )
+    flow_state_dim = _require_positive_int(
+        normalized.get("flow_state_dim"), "flow_state_dim"
+    )
+    expected_flow_state_dim = action_dim * action_horizon
+    if flow_state_dim != expected_flow_state_dim:
+        raise FlowActorCheckpointError(
+            "metadata.flow_state_dim must equal action_dim * action_horizon: "
+            f"got {flow_state_dim}, expected {expected_flow_state_dim}."
+        )
+    if normalized.get("action_layout") != CHUNK_MAJOR_ACTION_LAYOUT:
+        raise FlowActorCheckpointError(
+            f"metadata.action_layout must be {CHUNK_MAJOR_ACTION_LAYOUT!r}, got "
+            f"{normalized.get('action_layout')!r}."
+        )
+    normalized["latent_normalization"] = _validate_identity_latent_normalization(
+        normalized.get("latent_normalization")
+    )
+    if normalized.get("padding") != ZERO_PADDING:
+        raise FlowActorCheckpointError(
+            f"FlowTActor metadata requires padding={ZERO_PADDING!r}."
+        )
+    if normalized.get("mask_role") != LOSS_ONLY_MASK:
+        raise FlowActorCheckpointError(
+            f"FlowTActor metadata requires mask_role={LOSS_ONLY_MASK!r}."
+        )
+    if normalized.get("loss_reduction") != VALID_COORDINATE_MEAN:
+        raise FlowActorCheckpointError(
+            f"FlowTActor metadata requires loss_reduction={VALID_COORDINATE_MEAN!r}."
+        )
     action_range = normalized.get("action_range")
     if not isinstance(action_range, list) or len(action_range) != 2:
         raise FlowActorCheckpointError(
@@ -421,39 +533,27 @@ def build_flow_actor_metadata_from_config(model_cfg: Any) -> dict[str, Any]:
         raise FlowActorCheckpointError(
             "Only model.flow_actor_type='FlowTActor' can produce this artifact."
         )
-    flow_matching = model_cfg.get("flow_matching", None)
-    if flow_matching is None:
-        raise FlowActorCheckpointError(
-            "model.flow_matching is required to record checkpoint semantics."
-        )
-    objective = str(flow_matching.get("objective", ""))
-    time_fusion = None
-    if objective == IMPROVED_MEANFLOW_OBJECTIVE:
-        improved = flow_matching.get("improved_meanflow", None)
-        time_conditioning = (
-            improved.get("time_conditioning", None) if improved is not None else None
-        )
-        if time_conditioning is None or not time_conditioning.get("fusion", None):
-            raise FlowActorCheckpointError(
-                "Improved MeanFlow config requires "
-                "model.flow_matching.improved_meanflow.time_conditioning.fusion."
-            )
-        time_fusion = str(time_conditioning.get("fusion"))
-
-    extra_metadata: dict[str, Any] = {}
-    implementation = flow_matching.get("implementation", None)
-    if implementation is not None:
-        extra_metadata["implementation"] = str(implementation)
+    try:
+        spec = resolve_flow_bc_spec(model_cfg)
+    except ValueError as exc:
+        raise FlowActorCheckpointError(str(exc)) from exc
     return build_flow_actor_metadata(
-        objective=objective,
-        action_dim=int(model_cfg.get("action_dim", -1)),
+        objective=spec.objective,
+        action_dim=spec.action_dim,
         state_dim=int(model_cfg.state_dim),
         image_size=list(model_cfg.image_size),
         image_num=int(model_cfg.get("image_num", 1)),
-        time_fusion=time_fusion,
+        time_fusion=(
+            "concat_linear_2d_to_d"
+            if spec.objective == IMPROVED_MEANFLOW_OBJECTIVE
+            else None
+        ),
         action_range=list(model_cfg.get("action_scale", [-1.0, 1.0]) or [-1.0, 1.0]),
-        action_transform=str(flow_matching.get("action_transform", "")),
-        extra_metadata=extra_metadata,
+        action_transform=spec.action_transform,
+        action_horizon=spec.action_horizon,
+        flow_state_dim=spec.flow_state_dim,
+        action_layout=spec.action_layout,
+        latent_normalization=spec.latent_normalization,
     )
 
 
@@ -561,7 +661,7 @@ def _unwrap_module(module: nn.Module) -> nn.Module:
     return module
 
 
-def _assert_flow_t_actor_module(model: nn.Module, *, name: str) -> None:
+def _assert_flow_t_actor_module(model: nn.Module, *, name: str) -> nn.Module:
     unwrapped = _unwrap_module(model)
     actor = getattr(unwrapped, "flow_actor", None)
     if actor is None and unwrapped.__class__.__name__ == FLOW_ACTOR_TYPE:
@@ -572,6 +672,31 @@ def _assert_flow_t_actor_module(model: nn.Module, *, name: str) -> None:
             f"{name} must contain a PyTorch {FLOW_ACTOR_TYPE}; observed "
             f"flow_actor class {observed!r}."
         )
+    return actor
+
+
+def _target_actor_semantics(actor: nn.Module) -> dict[str, Any]:
+    """Return chunk semantics exposed by a live FlowTActor, when available."""
+    semantics: dict[str, Any] = {}
+    for attribute in ("action_dim", "action_horizon", "flow_state_dim"):
+        value = getattr(actor, attribute, None)
+        if value is not None:
+            semantics[attribute] = _require_positive_int(
+                value, f"target model flow_actor.{attribute}"
+            )
+    action_dim = semantics.get("action_dim")
+    horizon = semantics.get("action_horizon")
+    flow_state_dim = semantics.get("flow_state_dim")
+    if action_dim is not None and horizon is not None:
+        expected_flow_state_dim = action_dim * horizon
+        if flow_state_dim is not None and flow_state_dim != expected_flow_state_dim:
+            raise FlowActorCheckpointError(
+                "Target FlowTActor has inconsistent chunk dimensions: "
+                f"flow_state_dim={flow_state_dim}, expected {expected_flow_state_dim}."
+            )
+        semantics.setdefault("flow_state_dim", expected_flow_state_dim)
+        semantics["action_layout"] = CHUNK_MAJOR_ACTION_LAYOUT
+    return semantics
 
 
 def select_flow_actor_state_dict(
@@ -671,7 +796,7 @@ def export_flow_actor_checkpoint(
     torch.save(actor_state, weights_path)
     manifest = {
         "format": FLOW_ACTOR_CHECKPOINT_FORMAT,
-        "version": FLOW_ACTOR_CHECKPOINT_VERSION,
+        "schema": FLOW_ACTOR_CHECKPOINT_SCHEMA,
         "weights_file": str(weights_path.relative_to(checkpoint_dir)),
         "actor_scopes": list(scopes),
         "excluded_prefixes": list(exclusions),
@@ -705,14 +830,14 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
-def _validate_manifest(
+def _validate_manifest_semantics(
     manifest: Mapping[str, Any],
     resolved: ResolvedFlowActorCheckpoint,
-    state_dict: Mapping[str, torch.Tensor],
-) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """Validate artifact semantics and location without reading tensor bytes."""
     required = {
         "format",
-        "version",
+        "schema",
         "weights_file",
         "actor_scopes",
         "excluded_prefixes",
@@ -731,23 +856,62 @@ def _validate_manifest(
             f"Unsupported checkpoint format {manifest['format']!r}; expected "
             f"{FLOW_ACTOR_CHECKPOINT_FORMAT!r}."
         )
-    if type(manifest["version"]) is not int or (
-        manifest["version"] != FLOW_ACTOR_CHECKPOINT_VERSION
-    ):
+    if manifest["schema"] != FLOW_ACTOR_CHECKPOINT_SCHEMA:
         raise FlowActorCheckpointError(
-            f"Unsupported Flow actor checkpoint version {manifest['version']!r}; "
-            f"expected {FLOW_ACTOR_CHECKPOINT_VERSION}."
+            f"Unsupported Flow actor checkpoint schema {manifest['schema']!r}; "
+            f"expected {FLOW_ACTOR_CHECKPOINT_SCHEMA!r}. Old manifests are not "
+            "supported or converted."
         )
+    extra = sorted(set(manifest) - required)
+    if extra:
+        raise FlowActorCheckpointError(
+            f"Manifest {resolved.manifest_path} has unsupported fields: {extra}."
+        )
+
     relative_weights = manifest["weights_file"]
     if not isinstance(relative_weights, str) or Path(relative_weights).is_absolute():
         raise FlowActorCheckpointError(
             "Manifest weights_file must be a relative string path."
         )
+    assert resolved.manifest_path is not None
     manifest_weights_path = (resolved.manifest_path.parent / relative_weights).resolve()
     if manifest_weights_path != resolved.weights_path:
         raise FlowActorCheckpointError(
             f"Manifest points to {manifest_weights_path}, but resolved weights are "
             f"{resolved.weights_path}."
+        )
+
+    metadata = validate_flow_actor_metadata(manifest["metadata"])
+    inconsistent_semantics = [
+        field
+        for field in _SEMANTIC_MANIFEST_FIELDS
+        if manifest[field] != metadata[field]
+    ]
+    if inconsistent_semantics:
+        raise FlowActorCheckpointError(
+            "Top-level manifest semantics do not match metadata for fields: "
+            f"{inconsistent_semantics}."
+        )
+    return _SEMANTIC_MANIFEST_FIELDS, metadata
+
+
+def _validate_manifest(
+    manifest: Mapping[str, Any],
+    resolved: ResolvedFlowActorCheckpoint,
+    state_dict: Mapping[str, torch.Tensor],
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+    _, metadata = _validate_manifest_semantics(manifest, resolved)
+    base_required = {
+        "actor_scopes",
+        "excluded_prefixes",
+        "num_tensors",
+        "tensors",
+    }
+    missing_base = sorted(base_required - set(manifest))
+    if missing_base:
+        raise FlowActorCheckpointError(
+            f"Manifest {resolved.manifest_path} is missing required fields: "
+            f"{missing_base}."
         )
     if not isinstance(manifest["actor_scopes"], list):
         raise FlowActorCheckpointError("Manifest actor_scopes must be a list.")
@@ -796,17 +960,6 @@ def _validate_manifest(
             "Manifest tensor schema does not match checkpoint: "
             + "; ".join(mismatches[:10])
         )
-    metadata = validate_flow_actor_metadata(manifest["metadata"])
-    inconsistent_semantics = [
-        field
-        for field in _SEMANTIC_MANIFEST_FIELDS
-        if manifest[field] != metadata[field]
-    ]
-    if inconsistent_semantics:
-        raise FlowActorCheckpointError(
-            "Top-level manifest semantics do not match metadata for fields: "
-            f"{inconsistent_semantics}."
-        )
     return scopes, exclusions, metadata
 
 
@@ -846,6 +999,24 @@ def _validate_expected_metadata(
         )
 
 
+def read_flow_actor_checkpoint_metadata(
+    checkpoint: str | Path,
+    *,
+    expected_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read and validate manifest semantics without loading checkpoint tensors."""
+    resolved = resolve_flow_actor_checkpoint(checkpoint)
+    if resolved.manifest_path is None:
+        raise FlowActorCheckpointError(
+            f"{FLOW_ACTOR_MANIFEST_FILENAME} is required for {resolved.weights_path}."
+        )
+    manifest = _read_manifest(resolved.manifest_path)
+    _, metadata = _validate_manifest_semantics(manifest, resolved)
+    if expected_metadata is not None:
+        _validate_expected_metadata(metadata, expected_metadata)
+    return metadata
+
+
 def load_flow_actor_checkpoint(
     model: nn.Module,
     checkpoint: str | Path,
@@ -877,10 +1048,9 @@ def load_flow_actor_checkpoint(
         )
     if require_manifest is not True:
         raise FlowActorCheckpointError(
-            "FlowTActor artifacts require require_manifest=true; convert legacy "
-            "weights with export_flow_actor_checkpoint first."
+            "FlowTActor artifacts require require_manifest=true."
         )
-    _assert_flow_t_actor_module(model, name="target model")
+    target_actor = _assert_flow_t_actor_module(model, name="target model")
     resolved = resolve_flow_actor_checkpoint(checkpoint)
     checkpoint_state = _load_state_dict(resolved.weights_path)
 
@@ -898,6 +1068,13 @@ def load_flow_actor_checkpoint(
         )
         if expected_metadata is not None:
             _validate_expected_metadata(metadata, expected_metadata)
+        target_semantics = _target_actor_semantics(target_actor)
+        if target_semantics:
+            _validate_expected_metadata(
+                metadata,
+                target_semantics,
+                path="target_model",
+            )
 
     scopes = _normalize_prefixes(
         actor_scopes
@@ -993,16 +1170,22 @@ def load_flow_actor_checkpoint(
 
 
 __all__ = [
+    "CHUNK_MAJOR_ACTION_LAYOUT",
     "DEFAULT_ACTOR_SCOPES",
     "DEFAULT_EXCLUDED_PREFIXES",
     "FLOW_ACTOR_CHECKPOINT_FORMAT",
-    "FLOW_ACTOR_CHECKPOINT_VERSION",
+    "FLOW_ACTOR_CHECKPOINT_SCHEMA",
     "FLOW_ACTOR_FRAMEWORK",
     "FLOW_ACTOR_MANIFEST_FILENAME",
     "FLOW_ACTOR_TYPE",
+    "FLOW_T_IMPLEMENTATION",
     "FULL_WEIGHTS_FILENAME",
+    "IDENTITY_LATENT_NORMALIZATION",
     "IMPROVED_MEANFLOW_OBJECTIVE",
+    "LOSS_ONLY_MASK",
     "RECTIFIED_FLOW_OBJECTIVE",
+    "VALID_COORDINATE_MEAN",
+    "ZERO_PADDING",
     "FlowActorCheckpointError",
     "FlowActorLoadReport",
     "ResolvedFlowActorCheckpoint",
@@ -1010,6 +1193,7 @@ __all__ = [
     "build_flow_actor_metadata_from_config",
     "export_flow_actor_checkpoint",
     "load_flow_actor_checkpoint",
+    "read_flow_actor_checkpoint_metadata",
     "resolve_flow_actor_checkpoint",
     "select_flow_actor_state_dict",
     "validate_flow_actor_metadata",

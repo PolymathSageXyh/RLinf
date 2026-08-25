@@ -187,7 +187,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             save_flags = None
             if result.get("expert_label_flag", False):
                 save_flags = torch.full(
-                    (actions.shape[0], self.cfg.actor.model.num_action_chunks),
+                    (actions.shape[0], self.action_horizon),
                     True,
                     dtype=torch.bool,
                     device=actions.device,

@@ -24,6 +24,7 @@ from omegaconf import DictConfig
 from rlinf.scheduler import Channel, CommMapper, Worker
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import compute_rollout_metrics
+from rlinf.utils.model_config import resolve_model_action_horizon
 from rlinf.utils.utils import unpack_batch
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
@@ -43,7 +44,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
             micro_batch_size=self.cfg.actor.micro_batch_size,
             rollout_epoch=self.cfg.env.train.rollout_epoch,
             n_train_chunk_steps=self.cfg.env.train.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks,
+            // resolve_model_action_horizon(self.cfg.actor.model),
         )
         assert self.micro_batches_per_step % self.gradient_accumulation == 0, (
             f"micro_batches_per_step ({self.micro_batches_per_step}) must be divisible by "

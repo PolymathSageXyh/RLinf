@@ -58,7 +58,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/nas/xyh/checkpoints/50000" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT
+    model_path: "/nas/xyh/RLinf/logs/20260813-19:29:50-libero_10_ppo_openpi_meanflow_pi05_quickstart/libero_10_ppo_openpi_meanflow_pi05_quickstart_2NFE/checkpoints/global_step_800/actor" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT
     model_type: "openpi"
     num_action_chunks: 10
     num_steps: 2

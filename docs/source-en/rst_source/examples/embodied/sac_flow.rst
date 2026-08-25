@@ -97,71 +97,126 @@ For running on real hardware, please refer to :doc:`franka` for installation and
 Run It
 ------
 
-Pretrained Flow-T: GELLO demonstrations to online SACFlow
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Flow-T BC Action Chunks
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-RLinf also provides an opt-in, PyTorch-only path that reuses the same
-``FlowPolicy`` and ``FlowTActor`` for behavior cloning and online SACFlow:
+The PyTorch ``FlowPolicy`` and ``FlowTActor`` use one contract for a single
+action and for a future-action chunk. Set ``actor.model.action_horizon`` to a
+positive integer; the public action, target, and sample shapes are always
+``[B,H,A]``, where ``A`` is ``actor.model.action_dim``. ``H=1`` retains the
+horizon dimension. The GELLO example below uses ``A=7``.
 
-.. code-block:: text
+The GELLO dataset creates future windows within one episode. It returns a
+prefix ``action_valid_mask: [B,H]`` and writes exact zeros into invalid tail
+slots. The mask is used only by the loss and evaluation metrics. It is never
+passed to the field network or sampler, so a policy cannot observe the target
+episode's remaining length.
 
-   realworld_collect_data_gello.yaml
-     ├─ collected_data/ → RollingLeRobotDataset → Flow BC
-     └─ demos/          → TrajectoryReplayBuffer → online SACFlow
+Internally, ``FlowTActor`` flattens the chunk to a chunk-major ``[B,H*A]`` flow
+state. All horizons use ``tanh_latent`` and identity latent normalization.
+Only valid coordinates contribute to the RF/iMF loss, gradients, norms, and
+per-horizon metrics; zero padding never enters a metric denominator.
 
-The two entry configurations are:
+A minimal model contract is:
 
-- ``examples/sft/config/franka_gello_flow_bc.yaml`` for Rectified Flow or
-  experimental Improved MeanFlow supervision;
-- ``examples/embodiment/config/franka_sacflow_online_finetune.yaml`` for a
-  frozen-anchor warm-up followed by online SACFlow.
+.. code-block:: yaml
 
-The checked-in examples select Improved MeanFlow. To train and fine-tune
-Rectified Flow instead, change both
-``flow_matching.objective: rectified_flow`` and
-``flow_sampling.profile: rf_sacflow_sde_v1``, and set
-``flow_sampling.flow_sde.field_source: instantaneous_velocity``. Also remove
-the iMF-only ``noise_std_range`` and ``safe_initial_time`` keys from the
-``flow_sde`` block. Objective or checkpoint mismatches are rejected before
-weights are loaded.
+   actor:
+     model:
+       flow_actor_type: FlowTActor
+       action_dim: 7
+       action_horizon: 8
+       flow_matching:
+         implementation: pytorch_flow_t
+         objective: improved_meanflow
+         action_transform: tanh_latent
+         action_chunking:
+           action_layout: chunk_major
+           latent_normalization: identity
+       flow_sampling:
+         evaluation:
+           method: flow_ode
+           num_steps: 10
 
-Both configurations use ``flow_actor_type: FlowTActor``, a 19-dimensional
-state, one action chunk, and a 7-dimensional GELLO action including the
-gripper. The portable BC artifact is
-``actor/flow_actor/model_state_dict/full_weights.pt`` plus
-``actor/flow_actor/flow_actor_manifest.json``. A full online resume through
-``runner.resume_dir`` takes precedence over actor-only initialization.
+Static BC evaluation supports both ``flow_ode`` and ``flow_sde`` for every
+horizon. For iMF SDE, configure a positive ``noise_level``,
+``0 < std_min <= std_max``, and ``safe_initial_time > 1 - 1/num_steps``:
 
-Improved MeanFlow keeps its native direction (``t=1`` noise to ``t=0`` action)
-and conditions its interval field on two independently encoded times. Its ODE,
-flow-noise, and flow-SDE samplers evaluate only the adjacent interval field
-``U(z, t_from, t_to)``. The Flow-SDE transition follows the local OpenPI
-MeanFlow formula, but the Flow-T implementation neither imports nor modifies
-``openpi_action_model.py``. Online rollout is stochastic; evaluation is always
-the deterministic ODE.
+.. code-block:: yaml
 
-The online example initializes a fresh critic, hard-copies it to the target,
-starts alpha at 0.2, and samples the online and demonstration buffers 50/50.
-During the first 10,000 online transitions the critic trains normally while
-the actor receives only frozen-anchor action regularization and alpha remains
-fixed. Afterwards the actor loss is the SACFlow path-density objective plus
-the same anchor regularizer. The live actor and anchor use common initial and
-per-step noise when their actions are compared.
+   flow_sampling:
+     evaluation:
+       method: flow_sde
+       num_steps: 10
+     flow_sde:
+       noise_level: 0.1
+       noise_std_range: [0.005, 0.05]
+       safe_initial_time: 0.99
+       joint_path_logprob: true
 
-This iMF integration and the Franka deployment are engineering extensions.
-The SACFlow paper's Appendix-F experiments were performed in simulation, so
-validate checkpoint identity, action limits, stochastic-path scale, and the
-warm-up phase in a dummy or hardware-in-the-loop setup before enabling robot
-motion.
+RF SDE uses the existing corrected-drift kernel and accepts ``noise_level``
+only; ``noise_std_range`` and ``safe_initial_time`` are iMF-only. Explicit
+initial noise has shape ``[B,H,A]`` and explicit SDE step noise has shape
+``[B,N,H,A]``. Reusing both tensors reproduces the complete path.
 
-Launch the stages after replacing all data, checkpoint, robot, and target-pose
-placeholders:
+.. warning::
+
+   ``H>1`` currently supports offline BC and static ODE/SDE sampling only.
+   Online SACFlow, rollout, replay, discounting, and real-robot chunk execution
+   remain restricted to ``action_horizon: 1``.
+
+Train the checked-in GELLO example after setting its data and encoder paths:
 
 .. code-block:: bash
 
-   bash examples/embodiment/collect_data.sh realworld_collect_data_gello
    bash examples/sft/run_vla_sft.sh franka_gello_flow_bc
-   bash examples/embodiment/run_embodiment.sh franka_sacflow_online_finetune
+
+Evaluate a portable actor on validation episodes with ODE:
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=6 PYTHONPATH=. .venv/bin/python \
+     examples/sft/evaluate_franka_gello_flow_bc.py \
+     --checkpoint /path/to/global_step_N \
+     --data-root /path/to/collected_data \
+     --split val \
+     --sampler-method flow_ode \
+     --num-steps 10
+
+The same checkpoint can be evaluated with SDE without changing its weights:
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=6 PYTHONPATH=. .venv/bin/python \
+     examples/sft/evaluate_franka_gello_flow_bc.py \
+     --checkpoint /path/to/global_step_N \
+     --data-root /path/to/collected_data \
+     --split val \
+     --sampler-method flow_sde \
+     --num-steps 10 \
+     --sde-noise-level 0.1 \
+     --sde-noise-std-range 0.005 0.05 \
+     --sde-safe-initial-time 0.99 \
+     --initial-noise-seed 1234 \
+     --step-noise-seed 1235
+
+The report records the actual sampler, steps, SDE parameters, and random seeds.
+Aggregate and per-horizon metrics ignore padded slots. The all-valid full-chunk
+view includes only samples where ``action_valid_mask.all(dim=1)``. Best-of-K
+selects one whole valid chunk per observation rather than combining different
+samples across horizons.
+
+Portable artifacts contain ``flow_actor_manifest.json`` and
+``model_state_dict/full_weights.pt``. The manifest accepts only
+``schema: unified_flow_t_bc`` and records the objective/time contract, action
+horizon, internal flow width, chunk layout, identity normalization, zero
+padding, and loss-only mask role. ODE/SDE choice is runtime configuration and
+is not a weight-compatibility field. Old manifests, cross-horizon loads, and
+projection inflation are rejected.
+
+Online SACFlow remains an H=1 workflow. Produce a separate compatible H=1
+artifact with the same image/state/action and objective contract before using
+``examples/embodiment/config/franka_sacflow_online_finetune.yaml``.
 
 **1. Configuration Files**
 

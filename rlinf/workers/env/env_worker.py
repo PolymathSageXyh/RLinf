@@ -40,6 +40,7 @@ from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
+from rlinf.utils.model_config import resolve_model_action_horizon
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
@@ -103,6 +104,7 @@ class EnvWorker(Worker):
         self.model_cfg = (
             self.cfg.rollout.model if self.only_eval else self.cfg.actor.model
         )
+        self.action_horizon = resolve_model_action_horizon(self.model_cfg)
         train_env_cfg = self.cfg.env.get("train", None)
         eval_env_cfg = self.cfg.env.get("eval", None)
         self.enable_train = not self.only_eval and train_env_cfg is not None
@@ -146,14 +148,12 @@ class EnvWorker(Worker):
         self.n_train_chunk_steps = 0
         if self.enable_train:
             self.n_train_chunk_steps = (
-                self.cfg.env.train.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                self.cfg.env.train.max_steps_per_rollout_epoch // self.action_horizon
             )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
             self.n_eval_chunk_steps = (
-                self.cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                self.cfg.env.eval.max_steps_per_rollout_epoch // self.action_horizon
             )
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
@@ -203,7 +203,7 @@ class EnvWorker(Worker):
                     max_episode_length=max_episode_length,
                     num_envs=self.train_num_envs_per_stage,
                     only_success=collect_only_success,
-                    num_action_chunks=self.model_cfg.num_action_chunks,
+                    num_action_chunks=self.action_horizon,
                     action_dim=self.model_cfg.action_dim,
                 )
                 for _ in range(self.stage_num)
@@ -444,7 +444,7 @@ class EnvWorker(Worker):
             else chunk_actions,
             env_type=self.cfg.env.train.env_type,
             model_type=self.model_cfg.model_type,
-            num_action_chunks=self.model_cfg.num_action_chunks,
+            num_action_chunks=self.action_horizon,
             action_dim=self.model_cfg.action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
@@ -532,7 +532,7 @@ class EnvWorker(Worker):
             raw_chunk_actions=raw_actions,
             env_type=self.cfg.env.eval.env_type,
             model_type=self.model_cfg.model_type,
-            num_action_chunks=self.model_cfg.num_action_chunks,
+            num_action_chunks=self.action_horizon,
             action_dim=self.model_cfg.action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
@@ -867,7 +867,7 @@ class EnvWorker(Worker):
             return (
                 torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
                 .unsqueeze(1)
-                .repeat(1, self.model_cfg.num_action_chunks)
+                .repeat(1, self.action_horizon)
             )
 
         env_outputs: list[EnvOutput] = []

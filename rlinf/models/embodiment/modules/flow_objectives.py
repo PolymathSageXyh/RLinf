@@ -42,13 +42,23 @@ def _adaptive_weighted_mse(
     *,
     power: float,
     epsilon: float,
+    element_mask: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    per_sample_mse = (prediction - target).square().flatten(start_dim=1).mean(dim=-1)
+    error = torch.where(
+        element_mask,
+        prediction - target,
+        torch.zeros_like(prediction),
+    )
+    squared_error = error.square()
+    valid_count = element_mask.flatten(start_dim=1).sum(dim=-1).to(prediction.dtype)
+    per_sample_error_sum = squared_error.flatten(start_dim=1).sum(dim=-1)
+    per_sample_mse = per_sample_error_sum / valid_count
     denominator = (per_sample_mse + epsilon).pow(power).detach()
+    total_valid_count = valid_count.sum()
     return (
-        (per_sample_mse / denominator).mean(),
-        per_sample_mse.mean(),
-        denominator.mean(),
+        (valid_count * per_sample_mse / denominator).sum() / total_valid_count,
+        per_sample_error_sum.sum() / total_valid_count,
+        (valid_count * denominator).sum() / total_valid_count,
     )
 
 
@@ -77,12 +87,22 @@ def _resolve_predict_field(
             t_from: Tensor,
             t_to: Tensor | None,
         ) -> Any:
-            return predict_field(
-                condition,
-                flow_state,
-                t_from=t_from,
-                t_to=t_to,
+            public_shape = flow_state.shape
+            flat_state = flow_state.reshape(flow_state.shape[0], -1)
+            value = _extract_field_value(
+                predict_field(
+                    condition,
+                    flat_state,
+                    t_from=t_from,
+                    t_to=t_to,
+                )
             )
+            if value.shape != flat_state.shape:
+                raise ValueError(
+                    "FlowTActor field output must match flattened flow-state shape: "
+                    f"got {tuple(value.shape)} and {tuple(flat_state.shape)}."
+                )
+            return value.reshape(public_shape)
 
         return predict_from_condition
     if callable(actor_or_predict_field):
@@ -197,10 +217,82 @@ def _time_for_flow_state(time: Tensor, flow_state: Tensor) -> Tensor:
 def _validate_action(action: Tensor) -> None:
     if not isinstance(action, Tensor):
         raise TypeError(f"action must be a Tensor, got {type(action).__name__}.")
-    if action.ndim < 2:
-        raise ValueError("action must contain batch and action dimensions.")
+    if action.ndim != 3:
+        raise ValueError(
+            "Flow BC action must have canonical shape [B, H, A], got "
+            f"{tuple(action.shape)}."
+        )
     if not action.is_floating_point():
         raise TypeError("action must use a floating-point dtype.")
+    if not torch.isfinite(action).all():
+        raise ValueError("action must contain only finite values.")
+
+
+def _normalize_valid_mask(
+    action: Tensor,
+    valid_mask: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    """Validate a prefix mask and expand it over per-step action coordinates."""
+
+    if valid_mask is None:
+        raise ValueError("Flow BC requires valid_mask with shape [B, H].")
+    if not isinstance(valid_mask, Tensor):
+        raise TypeError("valid_mask must be a bool Tensor.")
+    if valid_mask.dtype != torch.bool or valid_mask.ndim != 2:
+        raise ValueError(
+            "valid_mask must be a bool Tensor with shape [B, H], got "
+            f"dtype={valid_mask.dtype}, shape={tuple(valid_mask.shape)}."
+        )
+    expected_shape = action.shape[:2]
+    if tuple(valid_mask.shape) != expected_shape:
+        raise ValueError(
+            f"valid_mask must have shape {expected_shape}, got "
+            f"{tuple(valid_mask.shape)}."
+        )
+    if torch.any(~valid_mask.any(dim=1)):
+        raise ValueError("Each sample must contain at least one valid action step.")
+    if valid_mask.shape[1] > 1 and torch.any(valid_mask[:, 1:] & ~valid_mask[:, :-1]):
+        raise ValueError("valid_mask must be prefix-valid for every sample.")
+
+    valid_mask = valid_mask.to(device=action.device)
+    element_mask = valid_mask.unsqueeze(-1).expand_as(action)
+    return valid_mask, element_mask
+
+
+def _per_horizon_mse_metrics(
+    prediction: Tensor,
+    target: Tensor,
+    valid_mask: Tensor,
+) -> dict[str, Tensor]:
+    """Report stable per-step MSEs without counting padded coordinates."""
+
+    horizon = valid_mask.shape[1]
+    if prediction.ndim != 3 or prediction.shape[1] != horizon:
+        raise ValueError("Per-horizon metrics require [B, H, A].")
+
+    squared_error = (prediction - target).square()
+    metrics = {}
+    action_dim = squared_error.shape[-1]
+    for step in range(horizon):
+        step_mask = valid_mask[:, step].unsqueeze(-1)
+        numerator = torch.where(
+            step_mask,
+            squared_error[:, step],
+            torch.zeros_like(squared_error[:, step]),
+        ).sum()
+        denominator = valid_mask[:, step].sum() * action_dim
+        # A horizon with no valid samples is reported as zero. Keeping a stable
+        # metric schema avoids distributed logger mismatches near episode tails.
+        value = numerator / denominator.clamp_min(1)
+        metrics[f"field_mse_h{step}"] = value.detach()
+        metrics[f"field_count_h{step}"] = denominator.detach()
+    return metrics
+
+
+def _masked_rms(value: Tensor, element_mask: Tensor) -> Tensor:
+    selected = torch.where(element_mask, value, torch.zeros_like(value))
+    count = element_mask.sum().to(value.dtype)
+    return torch.sqrt(selected.square().sum() / count)
 
 
 def _prepare_noise(
@@ -217,7 +309,10 @@ def _prepare_noise(
         raise ValueError(
             f"noise must match action shape {tuple(action.shape)}, got {shape}."
         )
-    return noise.to(device=action.device, dtype=action.dtype)
+    noise = noise.to(device=action.device, dtype=action.dtype)
+    if not torch.isfinite(noise).all():
+        raise ValueError("noise must contain only finite values.")
+    return noise
 
 
 class RectifiedFlowObjective(nn.Module):
@@ -247,8 +342,10 @@ class RectifiedFlowObjective(nn.Module):
         generator: torch.Generator | None = None,
         seed: int | None = None,
         update_stats: bool = False,
+        valid_mask: Tensor | None = None,
     ) -> FlowObjectiveOutput:
         _validate_action(action)
+        valid_mask, element_mask = _normalize_valid_mask(action, valid_mask)
         generator = _make_generator(action, generator, seed)
         noise = _prepare_noise(action, noise, generator)
         time = (
@@ -274,17 +371,22 @@ class RectifiedFlowObjective(nn.Module):
             target,
             power=self.adaptive_power,
             epsilon=self.adaptive_epsilon,
+            element_mask=element_mask,
         )
         return FlowObjectiveOutput(
             loss=loss,
             metrics={
                 "loss": loss.detach(),
                 "field_mse": field_mse.detach(),
+                "valid_coordinate_count": element_mask.sum().detach(),
                 "adaptive_denominator_mean": adaptive_denominator_mean.detach(),
                 "t_mean": time.detach().mean(),
-                "target_norm": target.detach().flatten(start_dim=1).norm(dim=-1).mean(),
-                "field_norm": (
-                    prediction.detach().flatten(start_dim=1).norm(dim=-1).mean()
+                "target_norm": _masked_rms(target.detach(), element_mask),
+                "field_norm": _masked_rms(prediction.detach(), element_mask),
+                **_per_horizon_mse_metrics(
+                    prediction.detach(),
+                    target.detach(),
+                    valid_mask,
                 ),
             },
         )
@@ -374,8 +476,10 @@ class ImprovedMeanFlowObjective(nn.Module):
         generator: torch.Generator | None = None,
         seed: int | None = None,
         update_stats: bool = False,
+        valid_mask: Tensor | None = None,
     ) -> FlowObjectiveOutput:
         _validate_action(action)
+        valid_mask, element_mask = _normalize_valid_mask(action, valid_mask)
         generator = _make_generator(action, generator, seed)
         noise = _prepare_noise(action, noise, generator)
         if time is None and r_time is None:
@@ -448,28 +552,30 @@ class ImprovedMeanFlowObjective(nn.Module):
             target,
             power=self.adaptive_power,
             epsilon=self.adaptive_epsilon,
+            element_mask=element_mask,
         )
         return FlowObjectiveOutput(
             loss=loss,
             metrics={
                 "loss": loss.detach(),
                 "field_mse": field_mse.detach(),
+                "valid_coordinate_count": element_mask.sum().detach(),
                 "adaptive_denominator_mean": adaptive_denominator_mean.detach(),
                 "t_mean": time.detach().mean(),
                 "r_mean": r_time.detach().mean(),
                 "time_gap_mean": (time - r_time).detach().mean(),
-                "target_norm": target.detach().flatten(start_dim=1).norm(dim=-1).mean(),
-                "field_norm": (
-                    regression_field.detach().flatten(start_dim=1).norm(dim=-1).mean()
+                "target_norm": _masked_rms(target.detach(), element_mask),
+                "field_norm": _masked_rms(regression_field.detach(), element_mask),
+                "boundary_field_norm": _masked_rms(
+                    boundary_field.detach(), element_mask
                 ),
-                "boundary_field_norm": (
-                    boundary_field.detach().flatten(start_dim=1).norm(dim=-1).mean()
+                "material_derivative_norm": _masked_rms(
+                    material_derivative.detach(), element_mask
                 ),
-                "material_derivative_norm": (
-                    material_derivative.detach()
-                    .flatten(start_dim=1)
-                    .norm(dim=-1)
-                    .mean()
+                **_per_horizon_mse_metrics(
+                    regression_field.detach(),
+                    target.detach(),
+                    valid_mask,
                 ),
             },
         )

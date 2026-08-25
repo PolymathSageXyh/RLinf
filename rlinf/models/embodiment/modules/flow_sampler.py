@@ -162,6 +162,8 @@ def sample_normal_transition(
         raise ValueError(
             f"x_mean and x_std shapes differ: {x_mean.shape} and {x_std.shape}."
         )
+    if not torch.isfinite(x_mean).all() or not torch.isfinite(x_std).all():
+        raise ValueError("stochastic transition moments must be finite.")
     if torch.any(x_std <= 0):
         raise ValueError("a stochastic transition requires x_std > 0.")
     if noise is None:
@@ -173,6 +175,8 @@ def sample_normal_transition(
                 f"{tuple(noise.shape)}."
             )
         noise = noise.to(device=x_mean.device, dtype=x_mean.dtype)
+    if not torch.isfinite(noise).all():
+        raise ValueError("transition noise must contain only finite values.")
 
     x_next = x_mean + x_std * noise
     distribution = Normal(x_mean, x_std)
@@ -241,6 +245,8 @@ def normalize_step_noises(
                 f"got {shape}."
             )
         normalized.append(noise.to(device=reference.device, dtype=reference.dtype))
+        if not torch.isfinite(normalized[-1]).all():
+            raise ValueError(f"step_noises[{index}] must contain only finite values.")
     return tuple(normalized)
 
 

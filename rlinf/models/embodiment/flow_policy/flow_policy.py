@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -26,13 +27,20 @@ from rlinf.models.embodiment.modules.q_head import MultiQHead
 from rlinf.models.embodiment.modules.resnet_utils import ResNetEncoder
 from rlinf.models.embodiment.modules.utils import init_mlp_weights, layer_init, make_mlp
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.utils.flow_bc_contract import FlowBCSpec, resolve_flow_bc_spec
 
-_FLOW_V2_IMPLEMENTATION = "pytorch_flow_t_v2"
+_PYTORCH_FLOW_T_IMPLEMENTATION = "pytorch_flow_t"
 
 
-def _is_flow_v2(cfg) -> bool:
+def _model_cfg_mapping(cfg) -> Mapping[str, Any]:
+    if isinstance(cfg, Mapping):
+        return cfg
+    return vars(cfg)
+
+
+def _is_pytorch_flow_t(cfg) -> bool:
     matching = getattr(cfg, "flow_matching", {}) or {}
-    return matching.get("implementation") == _FLOW_V2_IMPLEMENTATION
+    return matching.get("implementation") == _PYTORCH_FLOW_T_IMPLEMENTATION
 
 
 def _flow_sampling_section(cfg, section: str) -> dict[str, Any]:
@@ -40,46 +48,47 @@ def _flow_sampling_section(cfg, section: str) -> dict[str, Any]:
     return dict(sampling.get(section, {}) or {})
 
 
-def _flow_t_actor_kwargs(cfg) -> dict[str, Any]:
-    """Build only the opt-in v2 kwargs, preserving the legacy constructor call."""
-    if not _is_flow_v2(cfg):
-        return {}
-
-    matching = cfg.flow_matching
-    sampling = cfg.flow_sampling or {}
-    actor_sampling = dict(sampling.get("actor_update", {}) or {})
-    sampler_method = actor_sampling.get("method", "flow_ode")
-    denoising_steps = int(actor_sampling.get("num_steps", cfg.denoising_steps))
+def _flow_t_actor_kwargs(cfg, spec: FlowBCSpec) -> dict[str, Any]:
+    sampling = spec.actor_update or spec.evaluation
+    sampler_method = sampling.method if sampling is not None else "flow_ode"
+    denoising_steps = (
+        sampling.num_steps if sampling is not None else int(cfg.denoising_steps)
+    )
     configured_methods = {
-        section.get("method")
-        for name in ("actor_update", "online_rollout", "evaluation")
-        if (section := sampling.get(name, None)) is not None
+        section.method
+        for section in (spec.actor_update, spec.online_rollout, spec.evaluation)
+        if section is not None
     }
-
-    flow_noise = dict(sampling.get("flow_noise", {}) or {})
-    noise_std_range = flow_noise.get("noise_std_range", [0.01, 0.1])
-    flow_sde = dict(sampling.get("flow_sde", {}) or {})
-    sde_std_range = flow_sde.get("noise_std_range", [0.01, 0.1])
-    return {
-        "api_version": "v2",
-        "objective": matching["objective"],
+    flow_sde = spec.flow_sde
+    flow_noise_range = spec.flow_noise_std_range or (0.01, 0.1)
+    sde_std_range = (
+        flow_sde.noise_std_range
+        if flow_sde is not None and flow_sde.noise_std_range is not None
+        else (0.01, 0.1)
+    )
+    actor_kwargs = {
+        "objective": spec.objective,
         "sampler_method": sampler_method,
         "denoising_steps": denoising_steps,
+        "action_horizon": spec.action_horizon,
         "add_flow_noise_head": "flow_noise" in configured_methods,
-        "noise_level": float(flow_sde.get("noise_level", 0.1)),
-        "x_log_std_min": float(torch.tensor(noise_std_range[0]).log()),
-        "x_log_std_max": float(torch.tensor(noise_std_range[1]).log()),
+        "noise_level": 0.1 if flow_sde is None else flow_sde.noise_level,
+        "x_log_std_min": float(torch.tensor(flow_noise_range[0]).log()),
+        "x_log_std_max": float(torch.tensor(flow_noise_range[1]).log()),
         "sde_std_min": float(sde_std_range[0]),
         "sde_std_max": float(sde_std_range[1]),
-        "safe_initial_time": float(flow_sde.get("safe_initial_time", 0.99)),
+        "safe_initial_time": (
+            0.99
+            if flow_sde is None or flow_sde.safe_initial_time is None
+            else flow_sde.safe_initial_time
+        ),
     }
+    return actor_kwargs
 
 
-def _build_flow_bc_objective(cfg):
-    if not _is_flow_v2(cfg):
-        return None
+def _build_flow_bc_objective(cfg, spec: FlowBCSpec):
     matching = cfg.flow_matching
-    objective = matching["objective"]
+    objective = spec.objective
     if objective == "rectified_flow":
         return build_flow_objective(objective)
     objective_cfg = dict(matching.get("improved_meanflow", {}) or {})
@@ -106,9 +115,19 @@ def _actions_to_tanh_latent(
     actions: torch.Tensor,
     action_scale: torch.Tensor,
     action_bias: torch.Tensor,
+    valid_coordinate_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Invert the policy's affine-tanh action transform for supervised BC."""
     actions_fp32 = actions.float()
+    if valid_coordinate_mask is not None:
+        if (
+            valid_coordinate_mask.dtype != torch.bool
+            or valid_coordinate_mask.shape != actions.shape
+        ):
+            raise ValueError(
+                "valid_coordinate_mask must be bool and match actions shape."
+            )
+        valid_coordinate_mask = valid_coordinate_mask.to(device=actions.device)
     scale = action_scale.to(device=actions.device, dtype=torch.float32)
     bias = action_bias.to(device=actions.device, dtype=torch.float32)
     if torch.any(scale == 0):
@@ -124,13 +143,67 @@ def _actions_to_tanh_latent(
     outside_range = (unit_action < -1.0) | (unit_action > 1.0)
     clipped_unit_action = unit_action.clamp(-1.0 + 1e-4, 1.0 - 1e-4)
     latent = torch.atanh(clipped_unit_action)
+    if valid_coordinate_mask is not None:
+        outside_range = outside_range & valid_coordinate_mask
+        clamp_denominator = valid_coordinate_mask.sum().to(dtype=torch.float32)
+        clamp_fraction = outside_range.sum().to(dtype=torch.float32) / clamp_denominator
+        clamp_overshoot = torch.where(
+            valid_coordinate_mask,
+            (unit_action.abs() - 1.0).clamp_min(0.0),
+            torch.zeros_like(unit_action),
+        )
+    else:
+        clamp_fraction = outside_range.float().mean()
+        clamp_overshoot = (unit_action.abs() - 1.0).clamp_min(0.0)
     metrics = {
-        "action_clamp_fraction": outside_range.float().mean().detach(),
-        "action_clamp_abs_max": (
-            (unit_action.abs() - 1.0).clamp_min(0.0).max().detach()
-        ),
+        "action_clamp_fraction": clamp_fraction.detach(),
+        "action_clamp_abs_max": clamp_overshoot.max().detach(),
     }
     return latent.to(dtype=actions.dtype), metrics
+
+
+def _prepare_flow_bc_action_batch(
+    flow_actor: FlowTActor,
+    actions: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Validate and encode one canonical supervised action chunk."""
+
+    horizon = flow_actor.action_horizon
+    action_dim = flow_actor.action_dim
+    if actions.ndim != 3 or tuple(actions.shape[1:]) != (horizon, action_dim):
+        raise ValueError(
+            "Flow BC actions must have canonical shape "
+            f"[B, {horizon}, {action_dim}], got {tuple(actions.shape)}."
+        )
+
+    if not torch.is_tensor(valid_mask):
+        raise TypeError("action_valid_mask must be a bool Tensor.")
+    expected_mask_shape = (actions.shape[0], horizon)
+    if valid_mask.dtype != torch.bool or tuple(valid_mask.shape) != expected_mask_shape:
+        raise ValueError(
+            "action_valid_mask must be bool with shape "
+            f"{expected_mask_shape}, got dtype={valid_mask.dtype}, "
+            f"shape={tuple(valid_mask.shape)}."
+        )
+    valid_mask = valid_mask.to(device=actions.device)
+    if torch.any(~valid_mask.any(dim=1)):
+        raise ValueError("Each sample must contain at least one valid action step.")
+    if horizon > 1 and torch.any(valid_mask[:, 1:] & ~valid_mask[:, :-1]):
+        raise ValueError("action_valid_mask must be prefix-valid.")
+    coordinate_mask = valid_mask.unsqueeze(-1).expand_as(actions)
+    if not torch.isfinite(actions).all():
+        raise ValueError("Flow BC actions must contain only finite values.")
+    if torch.any(actions.masked_select(~coordinate_mask) != 0):
+        raise ValueError("Padded Flow BC action coordinates must be exactly zero.")
+
+    latent_actions, action_metrics = _actions_to_tanh_latent(
+        actions,
+        flow_actor.action_scale,
+        flow_actor.action_bias,
+        coordinate_mask,
+    )
+    return latent_actions, valid_mask, action_metrics
 
 
 @dataclass
@@ -140,7 +213,7 @@ class FlowConfig:
     image_num: int = 1
     action_dim: int = 4
     state_dim: int = 29
-    num_action_chunks: int = 1
+    action_horizon: int = 1
     backbone: str = "resnet"
     model_path: Optional[str] = None  # used as dir actually!
     encoder_config: dict[str, Any] = field(
@@ -178,7 +251,7 @@ class FlowConfig:
     noise_std_train: float = 0.3
     # Fixed noise std for rollout (if not using noise_std_head)
     noise_std_rollout: float = 0.02
-    # Opt-in PyTorch Flow-T v2 blocks. Empty mappings preserve legacy behavior.
+    # Unified PyTorch Flow-T blocks.
     flow_matching: dict[str, Any] = field(default_factory=dict)
     flow_sampling: dict[str, Any] = field(default_factory=dict)
     pretrained_actor: dict[str, Any] = field(default_factory=dict)
@@ -212,8 +285,17 @@ class FlowPolicy(nn.Module, BasePolicy):
     def __init__(self, cfg: FlowConfig):
         super().__init__()
         self.cfg = cfg
-        self.flow_v2 = _is_flow_v2(cfg)
-        self.flow_bc_objective = _build_flow_bc_objective(cfg)
+        self.is_pytorch_flow_t = _is_pytorch_flow_t(cfg)
+        self.flow_bc_spec = (
+            resolve_flow_bc_spec(_model_cfg_mapping(cfg))
+            if self.is_pytorch_flow_t
+            else None
+        )
+        self.flow_bc_objective = (
+            _build_flow_bc_objective(cfg, self.flow_bc_spec)
+            if self.flow_bc_spec is not None
+            else None
+        )
         self.in_channels = self.cfg.image_size[0]
 
         # Step1: Init Image encoders (same as CNNPolicy)
@@ -283,7 +365,12 @@ class FlowPolicy(nn.Module, BasePolicy):
                 "action_scale": action_scale,
                 "action_bias": action_bias,
             }
-            flow_actor_kwargs.update(_flow_t_actor_kwargs(self.cfg))
+            if self.flow_bc_spec is None:
+                raise ValueError(
+                    "FlowTActor requires flow_matching.implementation="
+                    f"{_PYTORCH_FLOW_T_IMPLEMENTATION!r}."
+                )
+            flow_actor_kwargs.update(_flow_t_actor_kwargs(self.cfg, self.flow_bc_spec))
             self.flow_actor = FlowTActor(**flow_actor_kwargs)
         elif self.cfg.flow_actor_type == "JaxFlowTActor":
             self.flow_actor = JaxFlowTActor(
@@ -336,10 +423,6 @@ class FlowPolicy(nn.Module, BasePolicy):
             )
         else:
             self.action_scale = None
-
-    @property
-    def num_action_chunks(self):
-        return self.cfg.num_action_chunks
 
     def preprocess_env_obs(self, env_obs, *, images_preprocessed: bool = False):
         device = next(self.parameters()).device
@@ -402,7 +485,7 @@ class FlowPolicy(nn.Module, BasePolicy):
         else:
             raise NotImplementedError
 
-    def _sample_v2_flow(
+    def _sample_flow(
         self,
         condition,
         *,
@@ -459,13 +542,13 @@ class FlowPolicy(nn.Module, BasePolicy):
     def sft_forward(self, data, **kwargs):
         """Compute PyTorch RF/iMF behavior-cloning loss on a LeRobot batch."""
         del kwargs
-        if not self.flow_v2 or self.flow_bc_objective is None:
+        if not self.is_pytorch_flow_t or self.flow_bc_objective is None:
             raise NotImplementedError(
                 "FlowPolicy SFT requires flow_matching.implementation="
-                f"{_FLOW_V2_IMPLEMENTATION!r}."
+                f"{_PYTORCH_FLOW_T_IMPLEMENTATION!r}."
             )
-        if not isinstance(data, dict) or "obs" not in data or "actions" not in data:
-            raise ValueError("FlowPolicy SFT data requires 'obs' and 'actions'.")
+        if not isinstance(data, dict) or "obs" not in data or "action" not in data:
+            raise ValueError("FlowPolicy SFT data requires 'obs' and 'action'.")
         images_preprocessed = _images_are_preprocessed(
             data.get("images_preprocessed", False)
         )
@@ -478,16 +561,17 @@ class FlowPolicy(nn.Module, BasePolicy):
             mix_feature, update_stats=self.training
         )
 
-        actions = data["actions"].to(device=mix_feature.device, dtype=mix_feature.dtype)
-        latent_actions, action_metrics = _actions_to_tanh_latent(
+        actions = data["action"].to(device=mix_feature.device, dtype=mix_feature.dtype)
+        latent_actions, valid_mask, action_metrics = _prepare_flow_bc_action_batch(
+            self.flow_actor,
             actions,
-            self.flow_actor.action_scale,
-            self.flow_actor.action_bias,
+            data.get("action_valid_mask"),
         )
         objective_output = self.flow_bc_objective(
             self.flow_actor,
             condition,
             latent_actions,
+            valid_mask=valid_mask,
         )
         return {
             **objective_output.metrics,
@@ -500,13 +584,17 @@ class FlowPolicy(nn.Module, BasePolicy):
         full_feature, visual_feature = self.get_feature(obs)
         mix_feature = self.mix_proj(full_feature)
 
-        if self.flow_v2:
+        if self.is_pytorch_flow_t:
+            if self.flow_actor.action_horizon != 1:
+                raise NotImplementedError(
+                    "Online SACFlow currently supports action_horizon=1 only."
+                )
             train = bool(kwargs.get("train", True))
             log_prob_mode = kwargs.get("log_prob_mode", "actor_surrogate")
             condition = self.flow_actor.encode_condition(
                 mix_feature, update_stats=train
             )
-            flow_sample = self._sample_v2_flow(
+            flow_sample = self._sample_flow(
                 condition,
                 sampling_section="actor_update",
                 train=train,
@@ -522,7 +610,7 @@ class FlowPolicy(nn.Module, BasePolicy):
                 raise RuntimeError(
                     "SAC Flow-T requires a stochastic sampler with path log-probability."
                 )
-            return flow_sample.action, log_prob, full_feature
+            return flow_sample.action[:, 0], log_prob, full_feature
 
         # Use flow actor to generate actions
         # FlowTActor expects obs as input, we pass mix_feature as the observation
@@ -566,11 +654,11 @@ class FlowPolicy(nn.Module, BasePolicy):
         full_feature, visual_feature = self.get_feature(obs)
         mix_feature = self.mix_proj(full_feature)
 
-        if self.flow_v2:
+        if self.is_pytorch_flow_t:
             condition = self.flow_actor.encode_condition(
                 mix_feature, update_stats=False
             )
-            flow_sample = self._sample_v2_flow(
+            flow_sample = self._sample_flow(
                 condition,
                 sampling_section="evaluation",
                 train=False,
@@ -628,13 +716,13 @@ class FlowPolicy(nn.Module, BasePolicy):
         full_feature, visual_feature = self.get_feature(env_obs)
         mix_feature = self.mix_proj(full_feature)
 
-        if self.flow_v2:
+        if self.is_pytorch_flow_t:
             mode = kwargs.get("mode", "train")
             section = "online_rollout" if mode == "train" else "evaluation"
             condition = self.flow_actor.encode_condition(
                 mix_feature, update_stats=False
             )
-            flow_sample = self._sample_v2_flow(
+            flow_sample = self._sample_flow(
                 condition,
                 sampling_section=section,
                 train=False,
@@ -658,16 +746,19 @@ class FlowPolicy(nn.Module, BasePolicy):
             action, log_prob = self.flow_actor(mix_feature, train=False, log_grad=False)
 
         # chunk_actions is always torch tensor
-        chunk_actions = action.reshape(
-            -1, self.cfg.num_action_chunks, self.cfg.action_dim
-        )
+        chunk_actions = action.reshape(-1, self.cfg.action_horizon, self.cfg.action_dim)
 
         if hasattr(self, "value_head") and calculate_values:
             chunk_values = self.value_head(mix_feature)
         else:
             chunk_values = torch.zeros_like(log_prob[..., :1])
 
-        forward_inputs = {"action": action}
+        forward_action = (
+            action[:, 0]
+            if self.is_pytorch_flow_t and self.flow_actor.action_horizon == 1
+            else action
+        )
+        forward_inputs = {"action": forward_action}
         if return_obs:
             # x1. image indexing logic changed
             forward_inputs["main_images"] = env_obs["main_images"]
@@ -690,7 +781,7 @@ class FlowStateConfig:
     input_type: str = "state"
     action_dim: int = 4
     obs_dim: int = 29
-    num_action_chunks: int = 1
+    action_horizon: int = 1
     encoder_config: dict[str, Any] = field(default_factory=dict)
     add_value_head: bool = False  # No visual_feature -> No mix_feature -> No value_head -> add_value_head must be false !
     add_q_head: bool = False
@@ -741,8 +832,17 @@ class FlowStatePolicy(nn.Module, BasePolicy):
     def __init__(self, cfg: FlowStateConfig):
         super().__init__()
         self.cfg = cfg
-        self.flow_v2 = _is_flow_v2(cfg)
-        self.flow_bc_objective = _build_flow_bc_objective(cfg)
+        self.is_pytorch_flow_t = _is_pytorch_flow_t(cfg)
+        self.flow_bc_spec = (
+            resolve_flow_bc_spec(_model_cfg_mapping(cfg))
+            if self.is_pytorch_flow_t
+            else None
+        )
+        self.flow_bc_objective = (
+            _build_flow_bc_objective(cfg, self.flow_bc_spec)
+            if self.flow_bc_spec is not None
+            else None
+        )
 
         # 3 layer MLP encoder for obs
         self.backbone = nn.Sequential(
@@ -781,7 +881,12 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                 "action_scale": action_scale,
                 "action_bias": action_bias,
             }
-            flow_actor_kwargs.update(_flow_t_actor_kwargs(self.cfg))
+            if self.flow_bc_spec is None:
+                raise ValueError(
+                    "FlowTActor requires flow_matching.implementation="
+                    f"{_PYTORCH_FLOW_T_IMPLEMENTATION!r}."
+                )
+            flow_actor_kwargs.update(_flow_t_actor_kwargs(self.cfg, self.flow_bc_spec))
             self.flow_actor = FlowTActor(**flow_actor_kwargs)
         elif self.cfg.flow_actor_type == "JaxFlowTActor":
             self.flow_actor = JaxFlowTActor(
@@ -831,11 +936,6 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         else:
             self.action_scale = None
 
-    # added num_action_chunks property
-    @property
-    def num_action_chunks(self):
-        return self.cfg.num_action_chunks
-
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
         return {"states": env_obs["states"].to(device)}
@@ -844,7 +944,11 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         """SAC forward pass using Flow Matching actor"""
         feat = self.backbone(obs["states"])
 
-        if self.flow_v2:
+        if self.is_pytorch_flow_t:
+            if self.flow_actor.action_horizon != 1:
+                raise NotImplementedError(
+                    "Online SACFlow currently supports action_horizon=1 only."
+                )
             train = bool(kwargs.get("train", True))
             log_prob_mode = kwargs.get("log_prob_mode", "actor_surrogate")
             condition = self.flow_actor.encode_condition(feat, update_stats=train)
@@ -868,7 +972,7 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                 raise RuntimeError(
                     "SAC Flow-T requires a stochastic sampler with path log-probability."
                 )
-            return sample.action, log_prob, None
+            return sample.action[:, 0], log_prob, None
 
         # Use flow actor to generate actions
         # FlowTActor expects obs as input, we pass mix_feature as the observation
@@ -909,18 +1013,25 @@ class FlowStatePolicy(nn.Module, BasePolicy):
     def sft_forward(self, data, **kwargs):
         """Compute state-only PyTorch RF/iMF behavior-cloning loss."""
         del kwargs
-        if not self.flow_v2 or self.flow_bc_objective is None:
-            raise NotImplementedError("FlowStatePolicy SFT requires PyTorch Flow-T v2.")
+        if not self.is_pytorch_flow_t or self.flow_bc_objective is None:
+            raise NotImplementedError(
+                "FlowStatePolicy SFT requires the unified PyTorch Flow-T path."
+            )
         obs = self.preprocess_env_obs(data["obs"])
         feat = self.backbone(obs["states"])
         condition = self.flow_actor.encode_condition(feat, update_stats=self.training)
-        actions = data["actions"].to(device=feat.device, dtype=feat.dtype)
-        latent_actions, action_metrics = _actions_to_tanh_latent(
+        actions = data["action"].to(device=feat.device, dtype=feat.dtype)
+        latent_actions, valid_mask, action_metrics = _prepare_flow_bc_action_batch(
+            self.flow_actor,
             actions,
-            self.flow_actor.action_scale,
-            self.flow_actor.action_bias,
+            data.get("action_valid_mask"),
         )
-        output = self.flow_bc_objective(self.flow_actor, condition, latent_actions)
+        output = self.flow_bc_objective(
+            self.flow_actor,
+            condition,
+            latent_actions,
+            valid_mask=valid_mask,
+        )
         return {**output.metrics, **action_metrics, "loss": output.loss}
 
     def default_forward(
@@ -955,7 +1066,7 @@ class FlowStatePolicy(nn.Module, BasePolicy):
 
         feat = self.backbone(env_obs["states"])  # encode obs using the 3 layer MLP
 
-        if self.flow_v2:
+        if self.is_pytorch_flow_t:
             mode = kwargs.get("mode", "train")
             section_name = "online_rollout" if mode == "train" else "evaluation"
             section = _flow_sampling_section(self.cfg, section_name)
@@ -985,13 +1096,16 @@ class FlowStatePolicy(nn.Module, BasePolicy):
             action, log_prob = self.flow_actor(feat, train=False, log_grad=False)
 
         # chunk_actions is always torch tensor
-        chunk_actions = action.reshape(
-            -1, self.cfg.num_action_chunks, self.cfg.action_dim
-        )
+        chunk_actions = action.reshape(-1, self.cfg.action_horizon, self.cfg.action_dim)
 
         chunk_values = torch.zeros_like(log_prob[..., :1])
 
-        forward_inputs = {"action": action}
+        forward_action = (
+            action[:, 0]
+            if self.is_pytorch_flow_t and self.flow_actor.action_horizon == 1
+            else action
+        )
+        forward_inputs = {"action": forward_action}
         if return_obs:
             forward_inputs["states"] = env_obs[
                 "states"

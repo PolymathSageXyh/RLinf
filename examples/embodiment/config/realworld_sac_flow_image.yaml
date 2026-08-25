@@ -160,7 +160,7 @@ actor:
     action_dim: 6 # 4 -> 6 for real world
     image_num: 1
         
-    num_action_chunks: 1 # only 1 is supported for now
+    action_horizon: 1 # only 1 is supported for now
     hidden_dim: 256
     
     precision: "32"
@@ -220,4 +220,3 @@ reward:
 
 critic:
   use_critic_model: False
-

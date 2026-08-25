@@ -44,6 +44,7 @@ from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_split_num,
 )
+from rlinf.utils.model_config import resolve_model_action_horizon
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
     split_dict_to_chunk,
@@ -575,8 +576,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         agg_q = self.cfg.algorithm.get("agg_q", "min")
         use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
         if use_dsrl:
-            num_action_chunks = self.cfg.actor.model.get("num_action_chunks", 1)
-            discount = self.cfg.algorithm.gamma**num_action_chunks
+            action_horizon = resolve_model_action_horizon(self.cfg.actor.model)
+            discount = self.cfg.algorithm.gamma**action_horizon
             rewards_for_bootstrap = batch["rewards"][:, 0:1].to(self.torch_dtype)
         else:
             discount = self.cfg.algorithm.gamma
@@ -720,6 +721,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         return make_common_flow_noise(
             batch_size=reference_tensor.shape[0],
+            action_horizon=self.cfg.actor.model.action_horizon,
             action_dim=self.cfg.actor.model.action_dim,
             denoising_steps=denoising_steps,
             device=reference_tensor.device,

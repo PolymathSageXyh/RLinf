@@ -98,61 +98,120 @@ SAC-Flow 工作原理
 运行
 ----------------------------------------
 
-预训练 Flow-T：从 GELLO 演示到在线 SACFlow
+Flow-T BC 动作分块
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-RLinf 还提供一条显式启用的纯 PyTorch 路径，让行为克隆和在线 SACFlow 复用同一个
-``FlowPolicy`` 与 ``FlowTActor``：
+PyTorch ``FlowPolicy`` 与 ``FlowTActor`` 对单步动作和未来动作 chunk 使用同一
+合同。将 ``actor.model.action_horizon`` 设置为正整数；公共 action、target 与
+sample shape 始终为 ``[B,H,A]``，其中 ``A`` 是 ``actor.model.action_dim``。
+``H=1`` 也保留 horizon 维；下方 GELLO 示例使用 ``A=7``。
 
-.. code-block:: text
+GELLO dataset 只在同一 episode 内构造 future window。它返回 prefix
+``action_valid_mask: [B,H]``，并将无效 tail slot 严格写为全零。mask 只用于 loss
+和评估指标，不传给 field network 或 sampler，因此策略无法看到 target episode 的剩余
+长度。
 
-   realworld_collect_data_gello.yaml
-     ├─ collected_data/ → RollingLeRobotDataset → Flow BC
-     └─ demos/          → TrajectoryReplayBuffer → online SACFlow
+``FlowTActor`` 内部将 chunk 展平为 chunk-major ``[B,H*A]`` flow state。
+所有 horizon 使用 ``tanh_latent`` 和 identity latent normalization。RF/iMF loss、
+梯度、norm 和逐 horizon metric 只统计 valid coordinate；zero padding 不进入指标分母。
 
-两份入口配置为：
+最小模型合同如下：
 
-- ``examples/sft/config/franka_gello_flow_bc.yaml``：训练 Rectified Flow 或实验性的
-  Improved MeanFlow；
-- ``examples/embodiment/config/franka_sacflow_online_finetune.yaml``：先执行冻结锚点
-  warm-up，再进行在线 SACFlow。
+.. code-block:: yaml
 
-仓库中的示例默认选择 Improved MeanFlow。若要改为训练并微调 Rectified Flow，需要同时
-设置 ``flow_matching.objective: rectified_flow`` 和
-``flow_sampling.profile: rf_sacflow_sde_v1``，并设置
-``flow_sampling.flow_sde.field_source: instantaneous_velocity``；同时从
-``flow_sde`` 配置块中删除仅供 iMF 使用的 ``noise_std_range`` 和
-``safe_initial_time``。目标或 checkpoint 语义不匹配时，会在加载权重前直接报错。
+   actor:
+     model:
+       flow_actor_type: FlowTActor
+       action_dim: 7
+       action_horizon: 8
+       flow_matching:
+         implementation: pytorch_flow_t
+         objective: improved_meanflow
+         action_transform: tanh_latent
+         action_chunking:
+           action_layout: chunk_major
+           latent_normalization: identity
+       flow_sampling:
+         evaluation:
+           method: flow_ode
+           num_steps: 10
 
-两份配置均使用 ``flow_actor_type: FlowTActor``、19 维状态、单动作块，以及包含夹爪的
-7 维 GELLO 动作。可移植 BC 产物由
-``actor/flow_actor/model_state_dict/full_weights.pt`` 和
-``actor/flow_actor/flow_actor_manifest.json`` 组成。通过 ``runner.resume_dir`` 恢复完整在线训练时，
-其优先级高于 actor-only 初始化。
+所有 horizon 的静态 BC 评估都支持 ``flow_ode`` 与 ``flow_sde``。iMF SDE
+需要配置正数 ``noise_level``、``0 < std_min <= std_max``，以及
+``safe_initial_time > 1 - 1/num_steps``：
 
-Improved MeanFlow 保持原生时间方向（``t=1`` 为噪声，``t=0`` 为动作），并用两个
-独立时间编码器为区间场提供条件。其 ODE、flow-noise 和 flow-SDE 采样器只查询相邻
-区间场 ``U(z, t_from, t_to)``。Flow-SDE transition 参照仓库内 OpenPI MeanFlow
-公式，但 Flow-T 实现不会导入或修改 ``openpi_action_model.py``。在线 rollout 使用
-随机采样，评估始终使用确定性 ODE。
+.. code-block:: yaml
 
-在线示例随机初始化 critic，将其硬拷贝为 target，令 alpha 从 0.2 开始，并按 50/50
-采样 online/demo buffer。前 10,000 个在线 transition 中，critic 正常更新，actor
-只接受 frozen-anchor 动作正则，alpha 保持不变；随后 actor loss 切换为 SACFlow
-路径密度目标加同一个锚点正则。比较 live actor 与 anchor 时，两者共享初始噪声与
-逐步噪声。
+   flow_sampling:
+     evaluation:
+       method: flow_sde
+       num_steps: 10
+     flow_sde:
+       noise_level: 0.1
+       noise_std_range: [0.005, 0.05]
+       safe_initial_time: 0.99
+       joint_path_logprob: true
 
-iMF 接入与 Franka 部署都是工程扩展。SACFlow 论文附录 F 的实验在仿真中完成，
-因此真机运动前必须在 dummy 或硬件在环环境中验证 checkpoint 输出一致性、动作限幅、
-随机路径尺度和 warm-up 阶段。
+RF SDE 使用现有 corrected-drift kernel，只接受 ``noise_level``；
+``noise_std_range`` 与 ``safe_initial_time`` 仅供 iMF 使用。显式 initial
+noise shape 为 ``[B,H,A]``，显式 SDE step noise shape 为 ``[B,N,H,A]``。
+复用这两个 tensor 可复现完整 path。
 
-替换数据、checkpoint、机器人和目标位姿占位符后，依次执行：
+.. warning::
+
+   ``H>1`` 当前只支持离线 BC 和静态 ODE/SDE 采样。online SACFlow、rollout、
+   replay、discount 和真机 chunk execution 仍限制为 ``action_horizon: 1``。
+
+设置数据与 encoder 路径后，运行仓库中的 GELLO 示例：
 
 .. code-block:: bash
 
-   bash examples/embodiment/collect_data.sh realworld_collect_data_gello
    bash examples/sft/run_vla_sft.sh franka_gello_flow_bc
-   bash examples/embodiment/run_embodiment.sh franka_sacflow_online_finetune
+
+使用 ODE 在 validation episodes 上评估 portable actor：
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=6 PYTHONPATH=. .venv/bin/python \
+     examples/sft/evaluate_franka_gello_flow_bc.py \
+     --checkpoint /path/to/global_step_N \
+     --data-root /path/to/collected_data \
+     --split val \
+     --sampler-method flow_ode \
+     --num-steps 10
+
+同一 checkpoint 无需修改权重即可切换为 SDE：
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=6 PYTHONPATH=. .venv/bin/python \
+     examples/sft/evaluate_franka_gello_flow_bc.py \
+     --checkpoint /path/to/global_step_N \
+     --data-root /path/to/collected_data \
+     --split val \
+     --sampler-method flow_sde \
+     --num-steps 10 \
+     --sde-noise-level 0.1 \
+     --sde-noise-std-range 0.005 0.05 \
+     --sde-safe-initial-time 0.99 \
+     --initial-noise-seed 1234 \
+     --step-noise-seed 1235
+
+报告记录实际 sampler、步数、SDE 参数和随机 seed。aggregate 与逐 horizon metric
+忽略 padded slot；all-valid full-chunk 视图只统计
+``action_valid_mask.all(dim=1)`` 的样本。best-of-K 为每个 observation 选择一条完整
+valid chunk，不会跨 horizon 组合不同 sample。
+
+portable artifact 包含 ``flow_actor_manifest.json`` 和
+``model_state_dict/full_weights.pt``。manifest 只接受
+``schema: unified_flow_t_bc``，并记录 objective/time 合同、action horizon、内部
+flow 宽度、chunk layout、identity normalization、zero padding 和 loss-only mask role。
+ODE/SDE 是运行时配置，不属于权重兼容字段。旧 manifest、跨 horizon load 和 projection
+inflation 都会被拒绝。
+
+online SACFlow 仍是 H=1 工作流。使用
+``examples/embodiment/config/franka_sacflow_online_finetune.yaml`` 前，需要单独
+产出 image/state/action 与 objective 合同一致的 H=1 artifact。
 
 **1. 配置文件**
 

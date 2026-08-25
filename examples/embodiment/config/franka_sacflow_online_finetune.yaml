@@ -154,14 +154,15 @@ actor:
     image_num: 1
     state_dim: 19
     action_dim: 7
-    num_action_chunks: 1
+    action_horizon: 1
     action_scale: [-1.0, 1.0]
 
     model_path: "/path/to/RLinf-ResNet10-pretrained"
     encoder_config:
       ckpt_name: "resnet10_pretrained.pt"
     pretrained_actor:
-      # Portable artifact exported by franka_gello_flow_bc.yaml.
+      # Portable artifact from an H=1 Flow BC run. H>1 chunk artifacts are
+      # intentionally rejected because online SACFlow remains single-step.
       path: "/path/to/global_step_N/actor/flow_actor"
       load_mode: "actor_only"
       require_manifest: true
@@ -183,9 +184,12 @@ actor:
     batch_norm_momentum: 0.99
 
     flow_matching:
-      implementation: "pytorch_flow_t_v2"
+      implementation: "pytorch_flow_t"
       objective: "improved_meanflow"
       action_transform: "tanh_latent"
+      action_chunking:
+        action_layout: "chunk_major"
+        latent_normalization: "identity"
       improved_meanflow:
         boundary_pair_probability: 0.5
         logit_mean: -0.4
@@ -198,8 +202,6 @@ actor:
           fusion: "concat_linear_2d_to_d"
 
     flow_sampling:
-      implementation: "pytorch_flow_t_v2"
-      profile: "imf_openpi_interval_sde_v1"
       actor_update:
         method: "flow_sde"
         num_steps: 4
@@ -210,7 +212,6 @@ actor:
         method: "flow_ode"
         num_steps: 4
       flow_sde:
-        field_source: "interval_average"
         noise_level: 0.10
         noise_std_range: [0.005, 0.05]
         safe_initial_time: 0.99

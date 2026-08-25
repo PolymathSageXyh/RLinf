@@ -1,7 +1,7 @@
 defaults:
   - env/maniskill_pick_cube@env.train
   - env/maniskill_pick_cube@env.eval
-  - model/mlp_policy@actor.model
+  - model/flow_policy@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
@@ -133,7 +133,7 @@ actor:
     policy_setup: "panda-ee-dpos"
     obs_dim: 42
     action_dim: 4
-    num_action_chunks: 1
+    action_horizon: 1
     hidden_dim: 256
     
     precision: "32"
@@ -189,4 +189,3 @@ reward:
 
 critic:
   use_critic_model: False
-

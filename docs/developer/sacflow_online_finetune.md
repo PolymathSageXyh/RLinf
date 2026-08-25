@@ -40,7 +40,7 @@ live actor 与 anchor 使用相同 observation 和同一组 initial/step noise�
 | 顺序 | 文件与关键符号 | 重点看什么 |
 |---|---|---|
 | 1 | [`examples/embodiment/config/franka_sacflow_online_finetune.yaml`](../../examples/embodiment/config/franka_sacflow_online_finetune.yaml) | 当前完整配置、路径占位符、默认 iMF 和 2-node placement |
-| 2 | [`rlinf/config.py::_validate_flow_policy_v2_cfg`](../../rlinf/config.py) | objective/profile/sampler/pretrained/Franka 合同如何 fail-fast |
+| 2 | [`rlinf/utils/flow_bc_contract.py::resolve_flow_bc_spec`](../../rlinf/utils/flow_bc_contract.py) | objective、sampler、pretrained 与 online H=1 合同如何 fail-fast |
 | 3 | [`examples/embodiment/train_embodied_agent.py::main`](../../examples/embodiment/train_embodied_agent.py) | `loss_type=embodied_sac` 如何选择 `EmbodiedSACFSDPPolicy` |
 | 4 | [`rlinf/runners/embodied_runner.py::EmbodiedRunner`](../../rlinf/runners/embodied_runner.py) | 权重同步、env/rollout/actor channel、训练、评估和保存顺序 |
 | 5 | [`rlinf/workers/actor/fsdp_sac_policy_worker.py::EmbodiedSACFSDPPolicy`](../../rlinf/workers/actor/fsdp_sac_policy_worker.py) | actor-only load、anchor/target/alpha/replay 初始化和三类 loss |
@@ -52,7 +52,7 @@ live actor 与 anchor 使用相同 observation 和同一组 initial/step noise�
 | 11 | [`rlinf/data/embodied_buffer_dataset.py::ReplayBufferDataset`](../../rlinf/data/embodied_buffer_dataset.py) | online/demo batch 混采比例 |
 | 12 | [`rlinf/data/replay_buffer.py::TrajectoryReplayBuffer`](../../rlinf/data/replay_buffer.py) | trajectory 存储、frame sampling、checkpoint/resume |
 | 13 | [`rlinf/utils/flow_actor_checkpoint.py::load_flow_actor_checkpoint`](../../rlinf/utils/flow_actor_checkpoint.py) | 为什么 BC/online objective、动作和模型结构必须一致 |
-| 14 | [`tests/unit_tests/test_sacflow_frozen_anchor_support.py`](../../tests/unit_tests/test_sacflow_frozen_anchor_support.py)、[`test_flow_t_actor_v2.py`](../../tests/unit_tests/test_flow_t_actor_v2.py) | phase、loss、共同噪声、SDE 和梯度合同的可执行示例 |
+| 14 | [`tests/unit_tests/test_sacflow_frozen_anchor_support.py`](../../tests/unit_tests/test_sacflow_frozen_anchor_support.py)、[`test_flow_t_actor.py`](../../tests/unit_tests/test_flow_t_actor.py) | phase、loss、共同噪声、SDE 和梯度合同的可执行示例 |
 
 异步路径只需要在理解同步 worker 后再读：
 
@@ -375,7 +375,7 @@ env:
     no_gripper: false
 ```
 
-当前 v2 是 7D gripper-inclusive 合同，任一 split 配置 `no_gripper: true` 都会在 config validation 阶段失败。
+当前 Flow-T 是 7D gripper-inclusive 合同，任一 split 配置 `no_gripper: true` 都会在 config validation 阶段失败。
 
 ### 8.2 pretrained checkpoint 与 resume
 
@@ -462,8 +462,6 @@ algorithm:
 
 ```yaml
 flow_sampling:
-  implementation: pytorch_flow_t_v2
-  profile: imf_openpi_interval_sde_v1
   actor_update:
     method: flow_sde
     num_steps: 4
@@ -474,7 +472,6 @@ flow_sampling:
     method: flow_ode
     num_steps: 4
   flow_sde:
-    field_source: interval_average
     noise_level: 0.10
     noise_std_range: [0.005, 0.05]
     safe_initial_time: 0.99
@@ -528,13 +525,11 @@ BC 和 online 的 objective 必须一起改。online 配置应使用完整 RF bl
 
 ```yaml
 flow_matching:
-  implementation: pytorch_flow_t_v2
+  implementation: pytorch_flow_t
   objective: rectified_flow
   action_transform: tanh_latent
 
 flow_sampling:
-  implementation: pytorch_flow_t_v2
-  profile: rf_sacflow_sde_v1
   actor_update:
     method: flow_sde
     num_steps: 4
@@ -545,7 +540,6 @@ flow_sampling:
     method: flow_ode
     num_steps: 4
   flow_sde:
-    field_source: instantaneous_velocity
     noise_level: 0.10
     joint_path_logprob: true
 ```
@@ -557,13 +551,11 @@ RF corrected SDE 的 std 直接由 `noise_level * sqrt(dt)` 产生，因此必�
 
 并把 `pretrained_actor.path` 改为 RF BC artifact。iMF checkpoint 不能加载到 RF。
 
-### 9.2 为什么 evaluation 不能改成随机 sampler
+### 9.2 evaluation sampler 的选择
 
-validator 固定要求 `evaluation.method=flow_ode`，以便：
-
-- checkpoint 前后做确定性动作对比；
-- 把策略质量变化与探索噪声分离；
-- 真机 validation 不意外注入 online SDE 噪声。
+`evaluation.method` 支持 `flow_ode` 与 `flow_sde`。ODE 是默认值，适合 checkpoint 前后
+做确定性动作对比；SDE 用于评估随机部署分布，必须显式配置 objective 对应的 SDE 参数
+和随机 seed。sampler 选择不属于 portable actor 的权重兼容字段。
 
 ### 9.3 为什么 online rollout 不能用 ODE
 
@@ -707,10 +699,10 @@ frozen-anchor resume 必须同时存在 `sac_components/anchor` 和 `sac_compone
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/unit_tests/test_flow_config_v2.py \
+  tests/unit_tests/test_flow_config.py \
   tests/unit_tests/test_flow_actor_checkpoint.py \
-  tests/unit_tests/test_flow_policy_v2.py \
-  tests/unit_tests/test_flow_t_actor_v2.py \
+  tests/unit_tests/test_flow_policy.py \
+  tests/unit_tests/test_flow_t_actor.py \
   tests/unit_tests/test_flow_replay_checkpoint.py \
   tests/unit_tests/test_sacflow_frozen_anchor_support.py
 ```
@@ -732,6 +724,6 @@ git diff --exit-code -- \
 - 纯 transition moments：`flow_transition.py`；
 - replay/demo 混采：`embodied_buffer_dataset.py`；
 - 不修改或 runtime import `openpi_action_model.py`；
-- 不给 `JaxFlowTActor` 增加 v2 分支。
+- 不把统一的 PyTorch Flow-T 合同扩展到 `JaxFlowTActor`。
 
 如果你还没有生成 portable actor checkpoint，请先读 [`flow_bc.md`](flow_bc.md)。

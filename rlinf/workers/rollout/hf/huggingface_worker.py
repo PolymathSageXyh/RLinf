@@ -32,6 +32,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.model_config import resolve_model_action_horizon
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -45,6 +46,7 @@ class MultiStepRolloutWorker(Worker):
         self.only_eval = cfg.runner.get("only_eval", False)
         self.algorithm_cfg = cfg.get("algorithm", {})
         self.model_cfg = cfg.rollout.model if self.only_eval else cfg.actor.model
+        self.action_horizon = resolve_model_action_horizon(self.model_cfg)
         self.actor_group_name = (
             cfg.actor.get("group_name", None)
             if cfg.get("actor", None) is not None
@@ -96,16 +98,14 @@ class MultiStepRolloutWorker(Worker):
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
 
         self.n_train_chunk_steps = (
-            cfg.env.train.max_steps_per_rollout_epoch
-            // self.model_cfg.num_action_chunks
+            cfg.env.train.max_steps_per_rollout_epoch // self.action_horizon
             if self.enable_train
             else 0
         )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
             self.n_eval_chunk_steps = (
-                cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                cfg.env.eval.max_steps_per_rollout_epoch // self.action_horizon
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
@@ -651,7 +651,7 @@ class MultiStepRolloutWorker(Worker):
                 save_flags = None
                 if result.get("expert_label_flag", False):
                     save_flags = torch.full(
-                        (actions.shape[0], self.model_cfg.num_action_chunks),
+                        (actions.shape[0], self.action_horizon),
                         True,
                         dtype=torch.bool,
                         device=actions.device,
