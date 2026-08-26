@@ -846,6 +846,24 @@ def _flow_cfg_reject_unknown(value, allowed: set[str], name: str) -> None:
         raise AssertionError(f"Unknown {name} keys: {unknown}")
 
 
+def _validate_rollout_step_divisibility(step_cfg, model_cfg, split_name: str) -> None:
+    """Require a rollout budget to contain only complete model action chunks."""
+    horizon = resolve_model_action_horizon(model_cfg)
+    field_name = f"env.{split_name}.max_steps_per_rollout_epoch"
+    primitive_steps = step_cfg.get("max_steps_per_rollout_epoch", None)
+    if (
+        isinstance(primitive_steps, bool)
+        or not isinstance(primitive_steps, Integral)
+        or primitive_steps <= 0
+    ):
+        raise AssertionError(f"{field_name} must be a positive integer")
+    if primitive_steps % horizon:
+        raise AssertionError(
+            f"{field_name}={primitive_steps} must be divisible by action horizon "
+            f"({horizon}); incomplete chunk remainder={primitive_steps % horizon}"
+        )
+
+
 def _validate_flow_policy_cfg(
     model_cfg,
     *,
@@ -853,6 +871,7 @@ def _validate_flow_policy_cfg(
     algorithm_cfg=None,
     data_cfg=None,
     resume_dir=None,
+    ckpt_path=None,
 ) -> FlowBCSpec | None:
     """Validate the single, versionless PyTorch Flow-T contract."""
     matching = _flow_cfg_mapping(model_cfg.get("flow_matching", None), "flow_matching")
@@ -904,6 +923,77 @@ def _validate_flow_policy_cfg(
             "PyTorch Flow-T requires actor.model.d_model >= "
             f"action_horizon * action_dim ({spec.flow_state_dim})"
         )
+
+    if task_type == "embodied_eval":
+        if bool(model_cfg.get("add_q_head", False)):
+            raise AssertionError(
+                "Flow-T embodied_eval requires actor.model.add_q_head=false"
+            )
+        if bool(model_cfg.get("add_value_head", False)):
+            raise AssertionError(
+                "Flow-T embodied_eval requires actor.model.add_value_head=false"
+            )
+        if ckpt_path:
+            raise AssertionError(
+                "Flow-T embodied_eval does not support runner.ckpt_path; "
+                "use rollout.model.pretrained_actor.path"
+            )
+        if resume_dir:
+            raise AssertionError(
+                "Flow-T embodied_eval does not support runner.resume_dir; "
+                "use a portable actor checkpoint"
+            )
+        for algorithm_name in ("sacflow", "sacflow_finetune"):
+            if algorithm_cfg is not None and algorithm_name in algorithm_cfg:
+                raise AssertionError(
+                    f"Flow-T embodied_eval rejects algorithm.{algorithm_name}"
+                )
+        sacflow_model_fields = {
+            "num_q_heads",
+            "q_head_type",
+            "noise_std_head",
+            "log_std_min_train",
+            "log_std_max_train",
+            "log_std_min_rollout",
+            "log_std_max_rollout",
+            "noise_std_train",
+            "noise_std_rollout",
+        }
+        configured_sacflow_fields = sorted(
+            field_name for field_name in sacflow_model_fields if field_name in model_cfg
+        )
+        if configured_sacflow_fields:
+            raise AssertionError(
+                "Flow-T embodied_eval rejects SACFlow-only model fields: "
+                f"{configured_sacflow_fields}"
+            )
+        _flow_cfg_reject_unknown(
+            pretrained,
+            {"path", "load_mode", "require_manifest", "strict_actor", "self_contained"},
+            "pretrained_actor",
+        )
+        required_pretrained = {
+            "path": pretrained.get("path", None),
+            "load_mode": pretrained.get("load_mode", None),
+            "require_manifest": pretrained.get("require_manifest", None),
+            "strict_actor": pretrained.get("strict_actor", None),
+            "self_contained": pretrained.get("self_contained", None),
+        }
+        if not required_pretrained["path"]:
+            raise AssertionError(
+                "Flow-T embodied_eval requires pretrained_actor.path"
+            )
+        if required_pretrained["load_mode"] != "actor_only":
+            raise AssertionError(
+                "Flow-T embodied_eval requires pretrained_actor.load_mode=actor_only"
+            )
+        for field_name in ("require_manifest", "strict_actor", "self_contained"):
+            if required_pretrained[field_name] is not True:
+                raise AssertionError(
+                    "Flow-T embodied_eval requires "
+                    f"pretrained_actor.{field_name}=true"
+                )
+        return spec
 
     if task_type == "sft":
         if bool(model_cfg.get("add_q_head", False)):
@@ -1042,9 +1132,10 @@ def validate_embodied_cfg(cfg):
     if model_type == SupportedModel.FLOW_POLICY:
         _validate_flow_policy_cfg(
             model_cfg,
-            task_type="embodied",
+            task_type="embodied_eval" if only_eval else "embodied",
             algorithm_cfg=algorithm_cfg,
             resume_dir=cfg.runner.get("resume_dir", None),
+            ckpt_path=cfg.runner.get("ckpt_path", None),
         )
         if model_cfg.get("flow_matching", None):
             for split_name in ("train", "eval"):
@@ -1191,13 +1282,7 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
-            cfg.env.eval.max_steps_per_rollout_epoch
-            % resolve_model_action_horizon(model_cfg)
-            == 0
-        ), (
-            "env.eval.max_steps_per_rollout_epoch must be divisible by the model action horizon"
-        )
+        _validate_rollout_step_divisibility(cfg.env.eval, model_cfg, "eval")
 
     if not only_eval:
         assert cfg.env.train.total_num_envs > 0, (
@@ -1221,13 +1306,7 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
-            cfg.env.train.max_steps_per_rollout_epoch
-            % resolve_model_action_horizon(model_cfg)
-            == 0
-        ), (
-            "env.train.max_steps_per_rollout_epoch must be divisible by the model action horizon"
-        )
+        _validate_rollout_step_divisibility(cfg.env.train, model_cfg, "train")
 
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
@@ -1378,13 +1457,7 @@ def validate_offline_cfg(cfg: DictConfig) -> DictConfig:
         ), (
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
-            cfg.env.eval.max_steps_per_rollout_epoch
-            % resolve_model_action_horizon(cfg.actor.model)
-            == 0
-        ), (
-            "env.eval.max_steps_per_rollout_epoch must be divisible by the model action horizon"
-        )
+        _validate_rollout_step_divisibility(cfg.env.eval, cfg.actor.model, "eval")
     return cfg
 
 

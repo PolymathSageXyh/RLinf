@@ -270,6 +270,15 @@ class FlowConfig:
             if self.backbone == "resnet":
                 self.std_range = (1e-5, 5)
 
+        self_contained = bool(self.pretrained_actor.get("self_contained", False))
+        if self_contained:
+            # Portable Flow-T artifacts include the complete encoder scopes. The
+            # runtime still builds the identical ResNet10/pooling/MLP structure,
+            # then the strict actor loader overwrites every actor tensor.
+            self.encoder_config.pop("ckpt_path", None)
+            self.encoder_config["self_contained"] = True
+            return
+
         assert self.model_path is not None, "Please specify the model_path."
         assert "ckpt_name" in self.encoder_config, (
             "Please specify the ckpt_name in encoder_config to load pretrained encoder weights."
@@ -296,6 +305,9 @@ class FlowPolicy(nn.Module, BasePolicy):
             if self.flow_bc_spec is not None
             else None
         )
+        self.self_contained_actor = bool(
+            cfg.pretrained_actor.get("self_contained", False)
+        )
         self.in_channels = self.cfg.image_size[0]
 
         # Step1: Init Image encoders (same as CNNPolicy)
@@ -306,7 +318,10 @@ class FlowPolicy(nn.Module, BasePolicy):
             for img_id in range(self.cfg.image_num):
                 self.encoders.append(
                     ResNetEncoder(
-                        sample_x, out_dim=256, encoder_cfg=self.cfg.encoder_config
+                        sample_x,
+                        out_dim=256,
+                        encoder_cfg=self.cfg.encoder_config,
+                        load_pretrained=not self.self_contained_actor,
                     )
                 )
                 encoder_out_dim += self.encoders[img_id].out_dim

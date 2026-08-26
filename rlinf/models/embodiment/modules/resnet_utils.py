@@ -96,19 +96,34 @@ class SpatialLearnedEmbeddings(nn.Module):
 
 
 class ResNetEncoder(nn.Module):
-    def __init__(self, sample_x, out_dim=256, encoder_cfg=None):
+    def __init__(
+        self,
+        sample_x,
+        out_dim=256,
+        encoder_cfg=None,
+        load_pretrained: bool = True,
+    ):
         super().__init__()
 
         self.out_dim = out_dim
-        self.encoder_cfg = encoder_cfg
+        self.encoder_cfg = encoder_cfg or {}
 
         self.num_spatial_blocks = 8
         self.pooling_method = "spatial_learned_embeddings"
-        self.use_pretrain = True
+        self.use_pretrain = bool(
+            load_pretrained and not self.encoder_cfg.get("self_contained", False)
+        )
 
-        self.resnet_backbone = ResNet10(pre_pooling=self.use_pretrain)
+        # Keep the feature-map shape identical to the pretrained path even
+        # when weights are supplied by a portable actor artifact.
+        self.resnet_backbone = ResNet10(pre_pooling=True)
         if self.use_pretrain:
             self._load_pretrained_weights()
+            self._freeze_backbone_weights()
+        else:
+            # Self-contained actors are evaluation artifacts. Their encoder
+            # tensors are restored by the portable actor loader and must not
+            # remain trainable if this module is used before worker freezing.
             self._freeze_backbone_weights()
 
         sample_embed = self.resnet_backbone(sample_x)

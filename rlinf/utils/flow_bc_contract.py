@@ -141,8 +141,10 @@ def resolve_flow_bc_spec(
     Args:
         model_cfg: The ``actor.model`` or ``rollout.model`` mapping.
         task_type: ``"sft"`` requires static evaluation sampling;
-            ``"embodied"`` additionally validates the H=1 online sampling
-            contract. ``None`` validates whichever sampling sections are present.
+            ``"embodied_eval"`` validates eval-only sampling for any action
+            horizon; ``"embodied"`` additionally validates the H=1 online
+            sampling contract. ``None`` validates whichever sampling sections
+            are present.
 
     Returns:
         An immutable canonical contract shared by data, model, and checkpoint code.
@@ -153,7 +155,7 @@ def resolve_flow_bc_spec(
     """
     if not isinstance(model_cfg, Mapping):
         raise FlowBCConfigError("Flow-T model config must be a mapping")
-    if task_type not in {None, "sft", "embodied"}:
+    if task_type not in {None, "sft", "embodied", "embodied_eval"}:
         raise FlowBCConfigError(f"Unsupported Flow-T task_type={task_type!r}")
     if "num_action_chunks" in model_cfg:
         raise FlowBCConfigError(
@@ -303,16 +305,27 @@ def resolve_flow_bc_spec(
     online_rollout = _sampling_section(sampling, "online_rollout")
     evaluation = _sampling_section(sampling, "evaluation")
 
-    if task_type == "sft":
+    if task_type in {"sft", "embodied_eval"}:
         if evaluation is None:
             raise FlowBCConfigError("flow_sampling.evaluation is required for Flow BC")
-        if actor_update is not None or online_rollout is not None:
+        if any(
+            section_name in sampling
+            for section_name in ("actor_update", "online_rollout")
+        ):
             raise FlowBCConfigError(
                 "Flow BC accepts only flow_sampling.evaluation sampling sections"
             )
         if evaluation.method not in {"flow_ode", "flow_sde"}:
             raise FlowBCConfigError(
                 "Flow BC flow_sampling.evaluation.method must be flow_ode or flow_sde"
+            )
+        if "flow_noise" in sampling:
+            raise FlowBCConfigError(
+                "Flow BC does not accept the SACFlow flow_sampling.flow_noise field"
+            )
+        if evaluation.method != "flow_sde" and "flow_sde" in sampling:
+            raise FlowBCConfigError(
+                "flow_sampling.flow_sde is only valid with evaluation.method=flow_sde"
             )
     elif task_type == "embodied":
         if action_horizon != 1:

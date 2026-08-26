@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import time
+from numbers import Integral
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
@@ -32,6 +33,12 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.flow_actor_checkpoint import (
+    DEFAULT_ACTOR_SCOPES,
+    DEFAULT_EXCLUDED_PREFIXES,
+    build_flow_actor_metadata_from_config,
+    load_flow_actor_checkpoint,
+)
 from rlinf.utils.model_config import resolve_model_action_horizon
 from rlinf.utils.placement import HybridComponentPlacement
 
@@ -98,14 +105,18 @@ class MultiStepRolloutWorker(Worker):
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
 
         self.n_train_chunk_steps = (
-            cfg.env.train.max_steps_per_rollout_epoch // self.action_horizon
+            self._resolve_chunk_steps(
+                cfg.env.train.max_steps_per_rollout_epoch,
+                "env.train.max_steps_per_rollout_epoch",
+            )
             if self.enable_train
             else 0
         )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
-            self.n_eval_chunk_steps = (
-                cfg.env.eval.max_steps_per_rollout_epoch // self.action_horizon
+            self.n_eval_chunk_steps = self._resolve_chunk_steps(
+                cfg.env.eval.max_steps_per_rollout_epoch,
+                "env.eval.max_steps_per_rollout_epoch",
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
@@ -131,7 +142,33 @@ class MultiStepRolloutWorker(Worker):
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
+    def _resolve_chunk_steps(self, primitive_steps: int, field_name: str) -> int:
+        """Resolve complete policy chunks without silently dropping tail steps."""
+        if (
+            isinstance(primitive_steps, bool)
+            or not isinstance(primitive_steps, Integral)
+            or primitive_steps <= 0
+        ):
+            raise ValueError(f"{field_name} must be a positive integer")
+        primitive_steps = int(primitive_steps)
+        remainder = primitive_steps % self.action_horizon
+        if remainder:
+            raise ValueError(
+                f"{field_name}={primitive_steps} must be divisible by action "
+                f"horizon ({self.action_horizon}); remainder={remainder}"
+            )
+        return primitive_steps // self.action_horizon
+
     def init_worker(self):
+        is_flow_eval = self.only_eval and SupportedModel(
+            self.model_cfg.model_type
+        ) == SupportedModel.FLOW_POLICY
+        if is_flow_eval and self.cfg.runner.get("ckpt_path", None):
+            raise ValueError(
+                "Flow-T embodied_eval does not support runner.ckpt_path; "
+                "configure rollout.model.pretrained_actor.path instead."
+            )
+
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
@@ -139,7 +176,41 @@ class MultiStepRolloutWorker(Worker):
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
-        if self.cfg.runner.get("ckpt_path", None):
+        if is_flow_eval:
+            pretrained_cfg = self.model_cfg.get("pretrained_actor", {})
+            if pretrained_cfg.get("self_contained", None) is not True:
+                raise ValueError(
+                    "Flow-T embodied_eval requires "
+                    "pretrained_actor.self_contained=true."
+                )
+            checkpoint_path = pretrained_cfg.get("path", None)
+            if not checkpoint_path:
+                raise ValueError(
+                    "Flow-T embodied_eval requires rollout.model.pretrained_actor.path."
+                )
+            report = load_flow_actor_checkpoint(
+                self.hf_model,
+                checkpoint_path,
+                load_mode=str(pretrained_cfg.get("load_mode", "actor_only")),
+                strict_actor=bool(pretrained_cfg.get("strict_actor", True)),
+                require_manifest=bool(pretrained_cfg.get("require_manifest", True)),
+                actor_scopes=DEFAULT_ACTOR_SCOPES,
+                excluded_prefixes=DEFAULT_EXCLUDED_PREFIXES,
+                expected_metadata=build_flow_actor_metadata_from_config(
+                    self.model_cfg
+                ),
+            )
+            if hasattr(self.hf_model, "encoders"):
+                self.hf_model.encoders.requires_grad_(False)
+            self.hf_model.requires_grad_(False)
+            self.log_info(
+                "Loaded Flow-T portable actor: "
+                f"weights={report.checkpoint.weights_path}, "
+                f"manifest={report.checkpoint.manifest_path}, "
+                f"tensors={len(report.loaded_keys)}, "
+                f"H={self.action_horizon}, A={self.model_cfg.action_dim}"
+            )
+        elif self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 

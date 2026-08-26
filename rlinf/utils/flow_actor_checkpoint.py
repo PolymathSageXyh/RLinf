@@ -529,26 +529,31 @@ def validate_flow_actor_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 def build_flow_actor_metadata_from_config(model_cfg: Any) -> dict[str, Any]:
     """Build canonical artifact metadata from a FlowPolicy model config."""
-    if str(model_cfg.get("flow_actor_type", "")) != FLOW_ACTOR_TYPE:
+    config_mapping = model_cfg if isinstance(model_cfg, Mapping) else vars(model_cfg)
+
+    def config_value(name: str, default: Any = None) -> Any:
+        return config_mapping.get(name, default)
+
+    if str(config_value("flow_actor_type", "")) != FLOW_ACTOR_TYPE:
         raise FlowActorCheckpointError(
             "Only model.flow_actor_type='FlowTActor' can produce this artifact."
         )
     try:
-        spec = resolve_flow_bc_spec(model_cfg)
+        spec = resolve_flow_bc_spec(config_mapping)
     except ValueError as exc:
         raise FlowActorCheckpointError(str(exc)) from exc
     return build_flow_actor_metadata(
         objective=spec.objective,
         action_dim=spec.action_dim,
-        state_dim=int(model_cfg.state_dim),
-        image_size=list(model_cfg.image_size),
-        image_num=int(model_cfg.get("image_num", 1)),
+        state_dim=int(config_value("state_dim")),
+        image_size=list(config_value("image_size")),
+        image_num=int(config_value("image_num", 1)),
         time_fusion=(
             "concat_linear_2d_to_d"
             if spec.objective == IMPROVED_MEANFLOW_OBJECTIVE
             else None
         ),
-        action_range=list(model_cfg.get("action_scale", [-1.0, 1.0]) or [-1.0, 1.0]),
+        action_range=list(config_value("action_scale", [-1.0, 1.0]) or [-1.0, 1.0]),
         action_transform=spec.action_transform,
         action_horizon=spec.action_horizon,
         flow_state_dim=spec.flow_state_dim,
@@ -1126,6 +1131,7 @@ def load_flow_actor_checkpoint(
 
     unexpected_keys = sorted(set(scoped_checkpoint) - set(scoped_target))
     shape_mismatches: list[str] = []
+    dtype_mismatches: list[str] = []
     compatible_state: dict[str, torch.Tensor] = {}
     for key in sorted(set(scoped_checkpoint) & set(scoped_target)):
         checkpoint_value = scoped_checkpoint[key]
@@ -1134,6 +1140,11 @@ def load_flow_actor_checkpoint(
             shape_mismatches.append(
                 f"{key}: checkpoint={tuple(checkpoint_value.shape)} "
                 f"model={tuple(target_value.shape)}"
+            )
+        elif checkpoint_value.dtype != target_value.dtype:
+            dtype_mismatches.append(
+                f"{key}: checkpoint={checkpoint_value.dtype} "
+                f"model={target_value.dtype}"
             )
         else:
             compatible_state[key] = checkpoint_value
@@ -1150,6 +1161,8 @@ def load_flow_actor_checkpoint(
         problems.append(f"unexpected actor keys={unexpected_keys[:20]}")
     if shape_mismatches:
         problems.append(f"shape mismatches={shape_mismatches[:20]}")
+    if dtype_mismatches:
+        problems.append(f"dtype mismatches={dtype_mismatches[:20]}")
     if unexpected_missing_keys:
         problems.append(f"missing actor keys={unexpected_missing_keys[:20]}")
     if problems:

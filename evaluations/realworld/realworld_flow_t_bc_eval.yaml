@@ -1,0 +1,141 @@
+defaults:
+  - env/realworld_peg_insertion@env.eval
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Two-node deployment: the GPU node runs policy inference and the Franka node
+# owns the real-world environment/controller.
+cluster:
+  num_nodes: 2
+  component_placement:
+    rollout:
+      node_group: "4090"
+      placement: 0
+    env:
+      node_group: franka
+      placement: 0
+  node_groups:
+    - label: "4090"
+      node_ranks: 0
+    - label: franka
+      node_ranks: 1
+      hardware:
+        type: Franka
+        configs:
+          - robot_ip: 172.16.0.4
+            node_rank: 1
+
+runner:
+  task_type: embodied_eval
+  only_eval: true
+  val_check_interval: -1
+  # Flow-T eval must use the manifest-aware actor loader below.
+  ckpt_path: null
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "realworld-flow-t-bc-h8"
+    logger_backends: null
+
+env:
+  group_name: "EnvGroup"
+  enable_offload: false
+
+  eval:
+    init_params:
+      id: "PegInsertionEnv-v1"
+    rollout_epoch: 20
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 200 # 25 policy calls x 8 primitive actions.
+    max_episode_steps: 200
+    auto_reset: false
+    ignore_terminations: false
+    no_gripper: false
+    use_spacemouse: false
+    # Match GELLO collection: RelativeFrame is applied before Quat2Euler and
+    # produces the same ordered 19-D state consumed during Flow-T BC training.
+    use_relative_frame: true
+    main_image_key: wrist_1
+    override_cfg:
+      is_dummy: false
+      robot_ip: "172.16.0.4"
+      task_description: "pick up the cube and place it at the target"
+      # Order must match collection: first serial -> wrist_1 -> data.image;
+      # second serial -> wrist_2 -> data.extra_view_image.
+      camera_serials:
+        - "230322276572"
+        - "230322274001"
+      target_ee_pose: [0.5, 0.0, 0.25, -3.14, 0.0, 0.0]
+      max_num_steps: 200
+      step_frequency: 5.0
+      
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  recompute_logprobs: false
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: false
+  collect_prev_infos: false
+
+  model:
+    model_type: "flow_policy"
+    input_type: "mixed"
+    model_path: null
+    backbone: "resnet"
+    encoder_config:
+      dropout: 0.1
+    precision: "32"
+    is_lora: false
+    image_size: [3, 128, 128]
+    image_num: 2
+    state_dim: 19
+    action_dim: 7
+    action_horizon: 8
+    action_scale: [-1.0, 1.0]
+    add_value_head: false
+    add_q_head: false
+    flow_actor_type: "FlowTActor"
+    denoising_steps: 2
+    d_model: 256
+    n_head: 4
+    n_layers: 2
+    use_batch_norm: false
+    batch_norm_momentum: 0.99
+
+    flow_matching:
+      implementation: "pytorch_flow_t"
+      objective: "improved_meanflow"
+      action_transform: "tanh_latent"
+      action_chunking:
+        action_layout: "chunk_major"
+        latent_normalization: "identity"
+      improved_meanflow:
+        boundary_pair_probability: 0.5
+        logit_mean: -0.4
+        logit_std: 1.0
+        adaptive_power: 0.5
+        adaptive_epsilon: 0.001
+        time_conditioning:
+          from_encoder: "independent_mlp"
+          to_encoder: "independent_mlp"
+          fusion: "concat_linear_2d_to_d"
+
+    flow_sampling:
+      evaluation:
+        method: "flow_ode"
+        num_steps: 2
+
+    pretrained_actor:
+      path: "/workspace/RLinf/global_step_100000/actor/flow_actor"
+      load_mode: "actor_only"
+      strict_actor: true
+      require_manifest: true
+      self_contained: true
