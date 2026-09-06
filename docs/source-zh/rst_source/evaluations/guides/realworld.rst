@@ -78,6 +78,9 @@ Ray 集群的完整搭建、固件版本与 libfranka 兼容性见 :doc:`../../e
    * - ``realworld_eval.yaml``
      - 自定义任务（``FrankaEnv-v1``）
      - π₀
+   * - ``realworld_flow_t_bc_eval.yaml``
+     - 使用脚踏标注 episode 结果的插销插入任务
+     - Flow-T BC
 
 若 ``evaluations/realworld/<config>.yaml`` 不存在，``run_eval.sh`` 会回退到 ``examples/embodiment/config/`` 下同名配置（需设置 ``runner.task_type: embodied_eval`` 与 ``runner.only_eval: True``）。详见 :doc:`../reference/cli`。
 Dual Franka 部署目前通过该回退路径使用 ``realworld_eval_dual_franka``。
@@ -285,6 +288,14 @@ Ray 集群启动
      - 并行环境数，真机通常为 1
    * - ``use_spacemouse``
      - 是否启用空间鼠标人工干预，评测时通常为 ``False``
+   * - ``keyboard_reward_wrapper``
+     - 设为 ``eval_control`` 后，使用 ``a`` 开始，并使用 ``b`` / ``c``
+       标记失败 / 成功
+   * - ``keyboard_eval_action_chunk_size``
+     - ``eval_control`` 模式下每个策略 chunk 包含的 primitive action 数量。
+       按下 ``b`` 或 ``c`` 时会立即记录结果，但仅在当前 chunk 执行完后发出
+       termination 和对应 reward。该值应与实际执行的模型 horizon 一致；
+       Flow-T 可设为 ``${rollout.model.action_horizon}``。
 
 ``run_eval.sh`` 行为
 ~~~~~~~~~~~~~~~~~~~~

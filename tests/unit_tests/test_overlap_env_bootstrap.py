@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 from omegaconf import OmegaConf
@@ -36,6 +37,56 @@ if "rlinf.envs.wrappers" not in sys.modules:
 from rlinf.scheduler.hardware.accelerators.accelerator import AcceleratorType
 from rlinf.utils.model_config import resolve_model_action_horizon  # noqa: E402
 from rlinf.workers.env.env_worker import EnvWorker  # noqa: E402
+
+
+def _load_keyboard_eval_control_wrapper():
+    """Load the wrapper with lightweight gym and keyboard dependencies."""
+    repo_root = Path(__file__).resolve().parents[2]
+    module_path = (
+        repo_root
+        / "rlinf/envs/realworld/common/wrappers/keyboard_eval_control_wrapper.py"
+    )
+
+    gym_module = ModuleType("gymnasium")
+
+    class Wrapper:
+        def __init__(self, env):
+            self.env = env
+
+    gym_module.Env = object
+    gym_module.Wrapper = Wrapper
+    gym_core_module = ModuleType("gymnasium.core")
+    gym_core_module.ActType = object
+    gym_core_module.ObsType = object
+
+    listener_module = ModuleType(
+        "rlinf.envs.realworld.common.keyboard.keyboard_listener"
+    )
+
+    class FakeKeyboardListener:
+        def __init__(self):
+            self.keys = []
+
+        def pop_pressed_keys(self):
+            keys, self.keys = self.keys, []
+            return keys
+
+    listener_module.KeyboardListener = FakeKeyboardListener
+
+    spec = importlib.util.spec_from_file_location(
+        "_keyboard_eval_control_wrapper_under_test", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(
+        sys.modules,
+        {
+            "gymnasium": gym_module,
+            "gymnasium.core": gym_core_module,
+            "rlinf.envs.realworld.common.keyboard.keyboard_listener": listener_module,
+        },
+    ):
+        spec.loader.exec_module(module)
+    return module.KeyboardEvalControlWrapper
 
 
 class TestModelActionHorizon(unittest.TestCase):
@@ -102,6 +153,78 @@ class TestModelActionHorizon(unittest.TestCase):
                 text = (repo_root / relative_path).read_text(encoding="utf-8")
                 self.assertIn("action_horizon:", text)
                 self.assertNotIn("num_action_chunks:", text)
+
+    def test_flow_t_eval_keyboard_chunk_size_tracks_action_horizon(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        text = (
+            repo_root / "evaluations/realworld/realworld_flow_t_bc_eval.yaml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("keyboard_reward_wrapper: eval_control", text)
+        self.assertIn(
+            "keyboard_eval_action_chunk_size: ${rollout.model.action_horizon}",
+            text,
+        )
+
+
+class TestKeyboardEvalControlWrapper(unittest.TestCase):
+    def test_result_is_emitted_after_remaining_chunk_actions(self):
+        wrapper_type = _load_keyboard_eval_control_wrapper()
+
+        class FakeEnv:
+            def __init__(self):
+                self.actions = []
+
+            @property
+            def unwrapped(self):
+                return self
+
+            def step(self, action):
+                self.actions.append(action)
+                obs = {"state": {"tcp_pose": [action]}}
+                return obs, 0.25, False, False, {}
+
+        for key, expected_reward, expected_result in (
+            ("b", 0.0, "failure"),
+            ("c", 1.0, "success"),
+        ):
+            with self.subTest(key=key):
+                env = FakeEnv()
+                wrapper = wrapper_type(env, action_chunk_size=4)
+                wrapper._running = True
+
+                outputs = []
+                for action in range(4):
+                    if action == 1:
+                        wrapper.listener.keys = [key]
+                    outputs.append(wrapper.step(action))
+
+                self.assertEqual(env.actions, [0, 1, 2, 3])
+                self.assertEqual(
+                    [output[2] for output in outputs], [False] * 3 + [True]
+                )
+                self.assertEqual(outputs[-1][1], expected_reward)
+                self.assertEqual(outputs[-1][4]["eval_result"], expected_result)
+                self.assertFalse(wrapper._running)
+
+    def test_idle_observation_does_not_alias_cached_observation(self):
+        wrapper_type = _load_keyboard_eval_control_wrapper()
+        wrapper = wrapper_type(MagicMock(), action_chunk_size=4)
+        wrapper.IDLE_POLL_S = 0
+        wrapper._last_obs = {"state": {"tcp_pose": [1, 2, 3, 4]}}
+
+        first_obs = wrapper.step(None)[0]
+        first_obs["state"]["tcp_pose"] = [99]
+        second_obs = wrapper.step(None)[0]
+
+        self.assertEqual(second_obs["state"]["tcp_pose"], [1, 2, 3, 4])
+
+    def test_action_chunk_size_must_be_positive_integer(self):
+        wrapper_type = _load_keyboard_eval_control_wrapper()
+        for value in (True, 0, -1, 1.5):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    wrapper_type(MagicMock(), action_chunk_size=value)
 
 
 class TestOverlapEnvBootstrap(unittest.TestCase):

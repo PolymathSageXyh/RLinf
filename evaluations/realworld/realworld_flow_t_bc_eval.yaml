@@ -59,6 +59,10 @@ env:
     ignore_terminations: false
     no_gripper: false
     use_spacemouse: false
+    # b/c records the result immediately, but the wrapper emits termination
+    # only after all primitive actions in the current policy chunk are run.
+    keyboard_reward_wrapper: eval_control
+    keyboard_eval_action_chunk_size: ${rollout.model.action_horizon}
     # Match GELLO collection: RelativeFrame is applied before Quat2Euler and
     # produces the same ordered 19-D state consumed during Flow-T BC training.
     use_relative_frame: true
@@ -72,8 +76,8 @@ env:
       camera_serials:
         - "230322276572"
         - "230322274001"
-      target_ee_pose: [0.5, 0.0, 0.25, -3.14, 0.0, 0.0]
-      max_num_steps: 200
+      target_ee_pose: [0.5, 0.0, 0.15, -3.14, 0.0, 0.0]
+      max_num_steps: 144
       step_frequency: 5.0
       
 rollout:
@@ -98,7 +102,7 @@ rollout:
     image_num: 2
     state_dim: 19
     action_dim: 7
-    action_horizon: 8
+    action_horizon: 4
     action_scale: [-1.0, 1.0]
     add_value_head: false
     add_q_head: false
@@ -134,7 +138,7 @@ rollout:
         num_steps: 2
 
     pretrained_actor:
-      path: "/workspace/RLinf/global_step_100000/actor/flow_actor"
+      path: "/workspace/RLinf/h4_90000/actor/flow_actor"
       load_mode: "actor_only"
       strict_actor: true
       require_manifest: true

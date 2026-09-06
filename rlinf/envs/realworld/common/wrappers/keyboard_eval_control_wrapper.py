@@ -13,11 +13,12 @@
 # limitations under the License.
 """Foot-pedal-gated wrapper for autonomous policy eval.
 
-Pedal: ``a`` starts a rollout from idle; ``c`` ends with reward=1
-("success"); ``b`` ends with reward=0 ("failure"). On end, returns
-``terminated=True`` and lets the outer ``auto_reset`` drive home.
+Pedal: ``a`` starts a rollout from idle; ``c`` records reward=1
+("success"); ``b`` records reward=0 ("failure"). A recorded result is
+returned as ``terminated=True`` at the end of the current action chunk.
 """
 
+import copy
 import math
 import time
 from typing import Any, SupportsFloat
@@ -35,18 +36,40 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
     PEDAL_DEBOUNCE_S = 0.2
     WAIT_HEARTBEAT_S = 10.0
 
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, action_chunk_size: int = 1):
+        """Initialize the wrapper.
+
+        Args:
+            env: Environment that executes one primitive action per ``step``.
+            action_chunk_size: Number of primitive actions in one policy chunk.
+                A ``b`` or ``c`` result is latched until this boundary.
+
+        Raises:
+            ValueError: If ``action_chunk_size`` is not a positive integer.
+        """
         super().__init__(env)
+        if (
+            isinstance(action_chunk_size, bool)
+            or not isinstance(action_chunk_size, int)
+            or action_chunk_size <= 0
+        ):
+            raise ValueError("action_chunk_size must be a positive integer")
+        self.action_chunk_size = action_chunk_size
         self.listener = KeyboardListener()
         self._running = False
         self._last_obs: Any = None
         self._last_press_ts: dict[str, float] = {}
+        self._chunk_step = 0
+        self._pending_result: str | None = None
 
     def reset(self, *, seed=None, options=None):
+        self._running = False
+        self._chunk_step = 0
+        self._pending_result = None
         self._last_press_ts.clear()
         self.listener.pop_pressed_keys()
         obs, info = self.env.reset(seed=seed, options=options)
-        self._last_obs = obs
+        self._last_obs = copy.deepcopy(obs)
         # Block until the operator has arranged the scene and presses 'a'.
         # This is intentional (the arms are homed and idle); log on entry and
         # emit a periodic heartbeat so the wait is not mistaken for a hang.
@@ -83,34 +106,43 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
                 self._last_press_ts[key] = now
                 if key == "a":
                     self._running = True
+                    self._chunk_step = 0
+                    self._pending_result = None
                     return self._idle_response(event="start")
             return self._idle_response(event=None)
 
         # Running: forward to the wrapped env.
         obs, reward, terminated, truncated, info = self.env.step(action)
-        self._last_obs = obs
 
         terminated = False
         truncated = False
+        self._chunk_step += 1
 
-        result: str | None = None
         for key in self.listener.pop_pressed_keys():
             now = time.monotonic()
             if now - self._last_press_ts.get(key, -math.inf) < self.PEDAL_DEBOUNCE_S:
                 continue
             self._last_press_ts[key] = now
-            if key == "c":
-                terminated = True
-                reward = 1.0
-                result = "success"
-                self._running = False
+            if key in ("b", "c") and self._pending_result is None:
+                self._pending_result = "success" if key == "c" else "failure"
+                self._log_info(
+                    f"Pedal '{key}' pressed; finishing the current action chunk "
+                    f"before recording {self._pending_result}."
+                )
                 break
-            if key == "b":
+
+        result: str | None = None
+        if self._chunk_step == self.action_chunk_size:
+            self._chunk_step = 0
+            result = self._pending_result
+            if result is not None:
                 terminated = True
-                reward = 0.0
-                result = "failure"
+                reward = 1.0 if result == "success" else 0.0
                 self._running = False
-                break
+                self._pending_result = None
+                # Outer observation wrappers mutate ``obs`` in place. Keep an
+                # isolated raw copy for subsequent idle responses.
+                self._last_obs = copy.deepcopy(obs)
 
         info["eval_phase"] = "rec" if self._running else "pre"
         info["eval_result"] = result
@@ -118,7 +150,7 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
 
     def _idle_response(self, event: str | None):
         info = {"eval_phase": "pre", "eval_event": event, "eval_result": None}
-        return self._last_obs, 0.0, False, False, info
+        return copy.deepcopy(self._last_obs), 0.0, False, False, info
 
     def _log_info(self, message: str) -> None:
         logger = getattr(self._base_env(), "_logger", None)

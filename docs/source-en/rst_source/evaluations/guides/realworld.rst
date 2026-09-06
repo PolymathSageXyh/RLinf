@@ -78,6 +78,9 @@ The following examples live under ``evaluations/realworld/``:
    * - ``realworld_eval.yaml``
      - Custom task (``FrankaEnv-v1``)
      - π₀
+   * - ``realworld_flow_t_bc_eval.yaml``
+     - Peg insertion with pedal-controlled episode labels
+     - Flow-T BC
 
 If ``evaluations/realworld/<config>.yaml`` is missing, ``run_eval.sh`` falls back to the same name under ``examples/embodiment/config/`` (set ``runner.task_type: embodied_eval`` and ``runner.only_eval: True``). See :doc:`../reference/cli`.
 Dual Franka deployment currently uses this fallback path with ``realworld_eval_dual_franka``.
@@ -285,6 +288,14 @@ Key ``env.eval`` fields
      - Parallel env count; typically 1 on real hardware
    * - ``use_spacemouse``
      - Enable spacemouse intervention; usually ``False`` for eval
+   * - ``keyboard_reward_wrapper``
+     - Set to ``eval_control`` to use ``a`` to start and ``b`` / ``c`` to
+       label failure / success
+   * - ``keyboard_eval_action_chunk_size``
+     - Primitive actions per policy chunk in ``eval_control`` mode. A ``b`` or
+       ``c`` press is recorded immediately, but termination and its reward are
+       emitted only after the current chunk finishes. Set this to the executed
+       model horizon, for example ``${rollout.model.action_horizon}`` for Flow-T.
 
 ``run_eval.sh`` behavior
 ~~~~~~~~~~~~~~~~~~~~~~~~
